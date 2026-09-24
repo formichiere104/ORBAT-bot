@@ -1,12 +1,12 @@
 # The ORBAT Bot
 
 
->**Table of contents**
->- [Description of the bot 🤖](#Description of the bot 🤖)
->- [Added Features And Improvements 🆕](#Added Features And Improvements 🆕)
->- [Commands 🕹️](#Commands 🕹️)
->- [Customization 🪄](#Customization 🪄)
->- [Future Updates 🗓️](#Future Updates 🗓️)
+> **Table of contents**
+> - [Description of the bot 🤖](#description-of-the-bot-)
+> - [Added Features And Improvements 🆕](#added-features-and-improvements-)
+> - [Commands 🕹️](#commands-)
+> - [Customization 🪄](#customization-)
+> - [Future Updates 🗓️](#future-updates-)
 
 ## Description of the bot 🤖
 >*what does he even do?*
