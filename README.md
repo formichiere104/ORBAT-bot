@@ -1,14 +1,14 @@
 # The ORBAT Bot
 
 > **Table of contents**
-> - [Description of the bot 🤖](#description-of-the-bot-)
-> - [Added Features And Improvements 🆕](#added-features-and-improvements-)
-> - [Commands 🕹️](#commands-)
-> - [Customization 🪄](#customization-)
-> - [Future Updates 🗓️](#future-updates-)
+> - [Description of the bot 🤖](#description-of-the-bot)
+> - [Added Features And Improvements 🆕](#added-features-and-improvements)
+> - [Commands 🕹️](#commands)
+> - [Customization 🪄](#customization)
+> - [Future Updates 🗓️](#future-updates)
 
 
-## Description of the bot 🤖
+## Description of the bot 
 >*what does he even do?*
 
 
@@ -16,8 +16,7 @@
 
 
 
-
-## Added Features And Improvements 🆕
+## Added Features And Improvements 
 
 - Added `/promote` `[username_list]` command, automates ORBAT promotion from private to lance corporal (automatically checks required points).
 	- `/promote` command now automatically sorts rows by rank on the ORBAT.
@@ -29,7 +28,7 @@
 	- General events use one reaction emoji per company; company events use Accepted/Declined/Tentative buttons. Both live-update the embed with members' display names, persist across restarts (`events_data.json`), and auto-create a reminder thread pinging attendees 20 minutes before start.
 
 
-## Commands 🕹️
+## Commands 
 >description
 
 | Command | Description | Permissions |
@@ -49,6 +48,6 @@
 
 
 
-## Future Updates 🗓️
+## Future Updates 
 
 
