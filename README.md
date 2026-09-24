@@ -2,11 +2,11 @@
 
 
 >**Table of contents**
->- [#Description of the bot 🤖]
->- [#Added Features And Improvements 🆕]
->- [#Commands 🕹️]
->- [#Customization 🪄]
->- [#Future Updates 🗓️]
+>- [Description of the bot 🤖](#Description of the bot 🤖)
+>- [Added Features And Improvements 🆕](#Added Features And Improvements 🆕)
+>- [Commands 🕹️](#Commands 🕹️)
+>- [Customization 🪄](#Customization 🪄)
+>- [Future Updates 🗓️](#Future Updates 🗓️)
 
 ## Description of the bot 🤖
 >*what does he even do?*
