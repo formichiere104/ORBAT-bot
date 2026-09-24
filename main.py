@@ -30,8 +30,9 @@ from gspread.cell import Cell
 import requests
 import asyncio
 import aiohttp
+import re
 
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 import os
 import json
@@ -157,8 +158,63 @@ EMBED_COLOR_SUCCESS = 0x57F287  # green  - things went well
 EMBED_COLOR_ERROR   = 0xED4245  # red    - validation / lookup failures
 EMBED_COLOR_GOLD    = 0xF1C40F  # gold   - "not yet", informational
 EMBED_COLOR_INFO    = 0x5865F2  # blurple - neutral default
+EMBED_COLOR_EVENT   = 0x2ECC71  # green  - /event embeds
 
 FOOTER_BRAND = "442nd ORBAT System"
+
+# ============================================================
+# EVENT SYSTEM CONFIG  (used by /event)
+# ============================================================
+# Everything /event needs to know about the battalion's companies /
+# detachments lives here. To wire this up for the real server:
+#   1. Replace each "emoji" below with the real custom emote, pasted
+#      straight from Discord (type \:emojiname: in a message and copy the
+#      result, e.g. "<:horn:123456789012345678>"). Plain unicode emoji
+#      (the keycap numbers below) and custom emoji strings both work —
+#      see the _as_emoji() helper further down.
+#   2. Optionally set "logo_url" to a direct image link. It's used as the
+#      default thumbnail on a company-specific event for that unit (only
+#      if the event creator doesn't upload their own thumbnail).
+# Nothing else in the code needs to change — every event command reads
+# through this dict instead of hardcoding company names.
+EVENT_TYPE_GENERAL = "general"   # one event for the whole battalion; one reaction emoji per company
+EVENT_TYPE_COMPANY = "company"   # one event for a single company; Accepted/Declined/Tentative buttons
+ 
+BATTALION_COMPANIES = {
+    # key                  label                            emoji    logo_url
+    "horn_company":      {"label": "Horn Company",             "emoji": "1️⃣", "logo_url": None},
+    "manticore_company": {"label": "Manticore Company",        "emoji": "2️⃣", "logo_url": None},
+    "doom_company":      {"label": "Doom Company",             "emoji": "3️⃣", "logo_url": None},
+    "battalion_command": {"label": "Battalion Command",        "emoji": "4️⃣", "logo_url": None},
+    "arc_detachment":    {"label": "ARC Detachment",           "emoji": "5️⃣", "logo_url": None},
+    "viper_company":     {"label": "Viper Company",            "emoji": "6️⃣", "logo_url": None},
+    "jedi":              {"label": "Jedi",                     "emoji": "7️⃣", "logo_url": None},
+    "arc_rc_liaison":    {"label": "ARC Liaison / RC Liaison", "emoji": "8️⃣", "logo_url": None},
+    "guests":            {"label": "Guests",                   "emoji": "9️⃣", "logo_url": None},
+}
+ 
+EVENT_REMINDER_LEAD_MINUTES     = 20    # how long before start the reminder thread + ping fires
+EVENT_REFRESH_DEBOUNCE_SECONDS  = 1.5   # coalesces a burst of reactions into a single embed edit
+EVENT_RSVP_MUTUALLY_EXCLUSIVE   = True  # company events: can a member only hold ONE of Accepted/Declined/Tentative at a time?
+EVENT_FIELD_CHAR_LIMIT          = 300   # per-category name list cap, keeps embeds under Discord's 6000-char total limit
+EVENT_DESCRIPTION_CHAR_LIMIT    = 500   # same reason
+EVENTS_FILE = "events_data.json"        # where tracked events + RSVP lists persist across bot restarts
+ 
+# Accepted formats for the start/end time prompts, tried in order. Add or
+# remove strptime patterns here — nothing else needs to change. Times are
+# entered in the user's OWN local time; their UTC offset (asked for in a
+# separate step) is what lets the bot convert it to a real UTC instant.
+DATETIME_FORMATS = [
+    "%d/%m/%Y %H:%M",
+    "%d-%m-%Y %H:%M",
+    "%Y-%m-%d %H:%M",
+]
+DATETIME_FORMAT_EXAMPLES = [
+    "26/09/2026 15:00",
+    "26-09-2026 15:00",
+    "2026-09-26 15:00",
+]
+
 
 
 # ============================================================
@@ -649,6 +705,20 @@ class MyBot(commands.Bot):
         # and keeps-alive connections under the hood, so this alone
         # meaningfully cuts down Roblox API latency on repeat lookups.
         self.http_session = aiohttp.ClientSession()
+
+
+        # Reload any /event events that were still active before the last
+        # restart (their RSVP lists and all), and re-register the
+        # persistent RSVP button view so company-event buttons keep
+        # working without the message needing to be resent. Must happen
+        # before tree.sync() so commands and components come up together.
+
+        global active_events
+        active_events = load_events()
+        self.add_view(EventRSVPView())
+        for event in active_events.values():
+            schedule_event_reminder(event)
+        print(f"Loaded {len(active_events)} tracked event(s) from disk.")
 
 
         guild = discord.Object(id=GUILD_ID)
@@ -1347,6 +1417,930 @@ async def req(interaction: discord.Interaction):
             embed=make_error_embed("Something Went Wrong", "An error occurred while processing the command.")
         )
 
+# ============================================================
+# EVENT SYSTEM  (/event)
+# ============================================================
+# Everything below builds the /event command: a DM-driven setup wizard
+# that ends with an embed posted in a channel, which people then RSVP to
+# either with reactions (general events, one emoji per company) or
+# buttons (company events: Accepted / Declined / Tentative). Config for
+# this lives in EVENT SYSTEM CONFIG near the top of the file.
+#
+# Layout of this section:
+#   A. In-memory state + JSON persistence (survives bot restarts)
+#   B. Small utilities (emoji handling, sentinels)
+#   C. Input validators (title, description, UTC offset, date/time, URL, channel)
+#   D. DM wizard views (buttons/selects) + the generic text-prompt helper
+#   E. Embed builder (shared by the preview AND the live posted embed)
+#   F. Posting a confirmed event + the wizard orchestrator
+#   G. The /event command itself
+#   H. Persistent RSVP button view (company events)
+#   I. Reaction handling (general events)
+#   J. 20-minutes-out reminder thread + ping
+ 
+ 
+# ----- A. State + persistence --------------------------------------------
+ 
+active_events = {}      # {message_id: event_dict} — the live source of truth, mirrored to disk on every change
+reminder_tasks = {}     # {message_id: asyncio.Task} — the scheduled 20-min-out reminder for each event
+active_setups = set()   # user_ids currently mid-wizard in their DMs, so a second /event can't collide with it
+_pending_refresh_tasks = {}  # {message_id: asyncio.Task} — debounces reaction bursts (see request_event_refresh)
+ 
+ 
+def _write_events_file(data):
+    with open(EVENTS_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+ 
+ 
+async def save_events():
+    """Persists active_events to disk (in a background thread, since file
+    I/O is blocking) so events and their RSVP lists survive a restart."""
+    try:
+        data = {str(message_id): ev for message_id, ev in active_events.items()}
+        await asyncio.to_thread(_write_events_file, data)
+    except OSError as e:
+        print(f"Failed to save events to {EVENTS_FILE}: {e}")
+ 
+ 
+def load_events():
+    """Loads persisted events back into memory at startup. A missing or
+    corrupt file just means 'no events yet', not a crash."""
+    if not os.path.exists(EVENTS_FILE):
+        return {}
+    try:
+        with open(EVENTS_FILE, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+        return {int(message_id): ev for message_id, ev in raw.items()}
+    except (json.JSONDecodeError, ValueError, OSError) as e:
+        print(f"Could not load {EVENTS_FILE}, starting with no tracked events: {e}")
+        return {}
+ 
+ 
+# ----- B. Small utilities --------------------------------------------------
+ 
+EVENT_CANCELLED = object()  # sentinel: user typed "cancel" during a text prompt
+EVENT_SKIPPED = object()    # sentinel: user typed "skip" on an optional text prompt
+ 
+ 
+class EventSetupCancelled(Exception):
+    """Raised internally the moment the /event wizard should stop (Cancel
+    pressed, 'cancel' typed, or a step timed out) — caught once at the top
+    of run_event_setup so every step below can just `raise` and let the
+    outer handler send the one cancellation/timeout message, instead of
+    each step repeating its own return-and-cleanup logic."""
+    pass
+ 
+ 
+def _as_emoji(emoji_str):
+    """Accepts either a plain unicode emoji or a custom emoji string like
+    '<:name:id>' / '<a:name:id>' (paste it straight from Discord) and
+    returns whatever discord.py's add_reaction()/SelectOption() expect."""
+    if emoji_str.startswith("<"):
+        return discord.PartialEmoji.from_str(emoji_str)
+    return emoji_str
+ 
+ 
+# ----- C. Input validators --------------------------------------------------
+# Each validator takes the raw text the user typed and returns
+# (True, parsed_value) on success or (False, error_message) to re-prompt.
+ 
+def validate_title(text):
+    if not text:
+        return False, "The title can't be empty."
+    if len(text) > 100:
+        return False, f"Titles must be 100 characters or fewer (yours is {len(text)})."
+    return True, text
+ 
+ 
+def validate_description(text):
+    if len(text) > EVENT_DESCRIPTION_CHAR_LIMIT:
+        return False, f"Descriptions must be {EVENT_DESCRIPTION_CHAR_LIMIT} characters or fewer (yours is {len(text)})."
+    return True, text
+ 
+ 
+UTC_OFFSET_PATTERN = re.compile(r"^(?:UTC|GMT)?\s*([+-]?\d{1,2})(?::?(\d{2}))?$", re.IGNORECASE)
+ 
+ 
+def validate_utc_offset(text):
+    text = text.strip()
+    if text.upper() in ("UTC", "GMT"):
+        return True, 0.0
+    match = UTC_OFFSET_PATTERN.match(text)
+    if not match:
+        return False, "Give your UTC offset like `+2`, `-5`, `+5:30`, or `UTC+1`."
+    hours = int(match.group(1))
+    minutes = int(match.group(2)) if match.group(2) else 0
+    offset = hours + (minutes / 60 if hours >= 0 else -minutes / 60)
+    if not -14 <= offset <= 14:
+        return False, "That offset is out of range — it must be between -14 and +14."
+    return True, offset
+ 
+ 
+def validate_datetime(text, utc_offset, after_epoch=None):
+    text = text.strip()
+    parsed = None
+    for fmt in DATETIME_FORMATS:
+        try:
+            parsed = datetime.strptime(text, fmt)
+            break
+        except ValueError:
+            continue
+    if parsed is None:
+        return False, "I couldn't read that date/time. Use one of the formats shown above."
+ 
+    # The user typed a LOCAL time at their given UTC offset. Treating the
+    # naive value as if it were already UTC and then subtracting the
+    # offset converts it into a true UTC instant, so the <t:...> timestamp
+    # Discord renders is correct for every viewer regardless of their own
+    # timezone.
+    utc_dt = parsed.replace(tzinfo=timezone.utc) - timedelta(hours=utc_offset)
+    epoch = int(utc_dt.timestamp())
+    now_epoch = int(datetime.now(timezone.utc).timestamp())
+ 
+    if epoch <= now_epoch:
+        return False, "That time is in the past — give a time in the future."
+    if after_epoch is not None and epoch <= after_epoch:
+        return False, "The end time must be after the start time."
+    return True, epoch
+ 
+ 
+URL_PATTERN = re.compile(r"^https?://\S+\.\S+$", re.IGNORECASE)
+ 
+ 
+def validate_url(text):
+    text = text.strip()
+    if not URL_PATTERN.match(text):
+        return False, "That doesn't look like a valid URL — it should start with `http://` or `https://`."
+    return True, text
+ 
+ 
+def resolve_channel(guild, text, needs_reactions):
+    """Resolves free text (a mention, an ID, or a name) to a postable
+    TextChannel in this guild, and checks the bot actually has the
+    permissions the event type will need there."""
+    text = text.strip()
+    channel = None
+ 
+    mention_match = re.match(r"^<#(\d+)>$", text)
+    id_match = re.match(r"^(\d{15,25})$", text)
+    if mention_match:
+        channel = guild.get_channel(int(mention_match.group(1)))
+    elif id_match:
+        channel = guild.get_channel(int(id_match.group(1)))
+    else:
+        name = text.lstrip("#").lower()
+        channel = discord.utils.find(lambda c: c.name.lower() == name, guild.text_channels)
+ 
+    if channel is None or not isinstance(channel, discord.TextChannel):
+        return False, "I couldn't find that channel in this server. Mention it (`#channel`), or give its exact name or ID."
+ 
+    perms = channel.permissions_for(guild.me)
+    missing = []
+    if not perms.send_messages:
+        missing.append("Send Messages")
+    if not perms.embed_links:
+        missing.append("Embed Links")
+    if needs_reactions and not perms.add_reactions:
+        missing.append("Add Reactions")
+    if missing:
+        return False, f"I don't have **{', '.join(missing)}** permission in {channel.mention}. Pick a different channel."
+    return True, channel
+ 
+ 
+# ----- D. DM wizard views + generic text-prompt helper ---------------------
+ 
+class EventCancelView(discord.ui.View):
+    """Shared base for every view used in the /event wizard. Restricts
+    interaction to whoever is actually running the wizard and gives every
+    step a consistent Cancel button + timeout behavior, instead of
+    repeating both bits of logic in every subclass."""
+ 
+    def __init__(self, author_id, timeout=300):
+        super().__init__(timeout=timeout)
+        self.author_id = author_id
+        self.value = None      # set by whichever button/select the user picks
+        self.message = None    # set by send_view() right after sending
+ 
+    async def interaction_check(self, interaction):
+        if interaction.user.id != self.author_id:
+            await interaction.response.send_message("This isn't your event setup.", ephemeral=True)
+            return False
+        return True
+ 
+    async def on_timeout(self):
+        for child in self.children:
+            child.disabled = True
+        if self.message is not None:
+            try:
+                await self.message.edit(view=self)
+            except discord.HTTPException:
+                pass  # message may have been deleted — nothing to do
+ 
+    async def _finish(self, interaction, value):
+        self.value = value
+        for child in self.children:
+            child.disabled = True
+        await interaction.response.edit_message(view=self)
+        self.stop()
+ 
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.danger, row=1)
+    async def cancel_btn(self, interaction, button):
+        await self._finish(interaction, "cancel")
+ 
+ 
+async def send_view(dm_channel, content, view):
+    """Sends a message carrying one of the wizard's views and remembers
+    the resulting Message on the view (so on_timeout can grey the buttons
+    out in place instead of leaving dead controls sitting there)."""
+    message = await dm_channel.send(content, view=view)
+    view.message = message
+    return message
+ 
+ 
+async def require_view_value(view, dm_channel):
+    """Waits for the view to be used, then either returns the chosen
+    value or raises EventSetupCancelled (after sending the reason) if the
+    user hit Cancel or the view timed out."""
+    await view.wait()
+    if view.value == "cancel":
+        await dm_channel.send(embed=make_error_embed("Event Creation Cancelled", "No event was created."))
+        raise EventSetupCancelled()
+    if view.value is None:
+        await dm_channel.send(embed=make_error_embed(
+            "Setup Timed Out", "You didn't respond in time, so the event setup was cancelled."
+        ))
+        raise EventSetupCancelled()
+    return view.value
+ 
+ 
+async def prompt_for_text(dm_channel, author_id, prompt_text, *, validator, allow_skip=False, timeout=300):
+    """Sends `prompt_text` in the DM and waits for the next message from
+    `author_id`, re-prompting on invalid input (via `validator`) until it
+    succeeds. Raises EventSetupCancelled on 'cancel' or a timeout; returns
+    EVENT_SKIPPED if `allow_skip` and the user types 'skip'."""
+ 
+    def check(m):
+        return m.author.id == author_id and m.channel.id == dm_channel.id
+ 
+    hint = "\n\n*Type `cancel` to stop this step"
+    hint += ", or `skip` to leave it blank.*" if allow_skip else ".*"
+    await dm_channel.send(prompt_text + hint)
+ 
+    while True:
+        try:
+            msg = await bot.wait_for("message", check=check, timeout=timeout)
+        except asyncio.TimeoutError:
+            await dm_channel.send(embed=make_error_embed(
+                "Setup Timed Out", "You took too long to respond, so the event setup was cancelled."
+            ))
+            raise EventSetupCancelled()
+ 
+        content = msg.content.strip()
+        if content.lower() == "cancel":
+            await dm_channel.send(embed=make_error_embed("Event Creation Cancelled", "No event was created."))
+            raise EventSetupCancelled()
+        if allow_skip and content.lower() == "skip":
+            return EVENT_SKIPPED
+ 
+        ok, result = validator(content)
+        if ok:
+            return result
+        await dm_channel.send(embed=make_error_embed("Invalid Input", result))
+        # loop back and wait for another message under the same prompt
+ 
+ 
+class EventTypeView(EventCancelView):
+    @discord.ui.button(label="🌐 General Event", style=discord.ButtonStyle.primary, row=0)
+    async def general_btn(self, interaction, button):
+        await self._finish(interaction, EVENT_TYPE_GENERAL)
+ 
+    @discord.ui.button(label="🎖️ Company Event", style=discord.ButtonStyle.primary, row=0)
+    async def company_btn(self, interaction, button):
+        await self._finish(interaction, EVENT_TYPE_COMPANY)
+ 
+ 
+class CompanySelectView(EventCancelView):
+    def __init__(self, author_id):
+        super().__init__(author_id)
+        options = [
+            discord.SelectOption(label=info["label"], value=key, emoji=_as_emoji(info["emoji"]))
+            for key, info in BATTALION_COMPANIES.items()
+            if key != "guests"  # "Guests" isn't a company you can host a company-specific event for
+        ]
+        self.select = discord.ui.Select(placeholder="Choose a company...", options=options, row=0)
+        self.select.callback = self._on_select
+        self.add_item(self.select)
+ 
+    async def _on_select(self, interaction):
+        await self._finish(interaction, self.select.values[0])
+ 
+ 
+class ChannelChoiceView(EventCancelView):
+    def __init__(self, author_id, origin_channel):
+        super().__init__(author_id)
+        here_label = f"Post here (#{origin_channel.name})"[:80]
+        here_btn = discord.ui.Button(label=here_label, style=discord.ButtonStyle.primary, row=0)
+        here_btn.callback = self._on_here
+        self.add_item(here_btn)
+ 
+        choose_btn = discord.ui.Button(label="Choose a different channel", style=discord.ButtonStyle.secondary, row=0)
+        choose_btn.callback = self._on_choose
+        self.add_item(choose_btn)
+ 
+    async def _on_here(self, interaction):
+        await self._finish(interaction, "here")
+ 
+    async def _on_choose(self, interaction):
+        await self._finish(interaction, "choose")
+ 
+ 
+class ConfirmView(EventCancelView):
+    @discord.ui.button(label="✅ Confirm & Post", style=discord.ButtonStyle.success, row=0)
+    async def confirm_btn(self, interaction, button):
+        await self._finish(interaction, "confirm")
+ 
+ 
+# ----- E. Embed builder -----------------------------------------------------
+ 
+def build_event_embed(event):
+    """Builds the event embed from an event dict — used for BOTH the DM
+    preview and the live posted message (edited in place as people
+    RSVP), so the two can never drift apart."""
+    embed = discord.Embed(
+        title=event["title"],
+        description=truncate_field(event["description"], limit=EVENT_DESCRIPTION_CHAR_LIMIT) if event.get("description") else None,
+        color=EMBED_COLOR_EVENT,
+    )
+ 
+    time_value = f"<t:{event['start_epoch']}:F>\n<t:{event['start_epoch']}:R>"
+    embed.add_field(name="🗓️ Time", value=time_value, inline=False)
+    if event.get("end_epoch"):
+        end_value = f"<t:{event['end_epoch']}:F>\n<t:{event['end_epoch']}:R>"
+        embed.add_field(name="🏁 Ends", value=end_value, inline=False)
+ 
+    if event["type"] == EVENT_TYPE_GENERAL:
+        total = 0
+        for key, info in BATTALION_COMPANIES.items():
+            members = event["categories"].get(key, [])
+            names = [event["display_names"].get(str(uid), f"<@{uid}>") for uid in members]
+            embed.add_field(
+                name=f"{info['emoji']} {info['label']} ({len(members)})",
+                value=truncate_field("\n".join(names), limit=EVENT_FIELD_CHAR_LIMIT) if names else "—",
+                inline=True,
+            )
+            total += len(members)
+        footer_text = f"{FOOTER_BRAND} • Created by {event['creator_name']} • {total} attending"
+    else:
+        company_info = BATTALION_COMPANIES.get(event["company"], {"label": event.get("company") or "Unknown", "emoji": ""})
+        embed.set_author(name=f"{company_info['emoji']} {company_info['label']} Event".strip())
+        for key, label in (("accepted", "✅ Accepted"), ("declined", "❌ Declined"), ("tentative", "❓ Tentative")):
+            members = event["categories"].get(key, [])
+            names = [event["display_names"].get(str(uid), f"<@{uid}>") for uid in members]
+            embed.add_field(
+                name=f"{label} ({len(members)})",
+                value=truncate_field("\n".join(names), limit=EVENT_FIELD_CHAR_LIMIT) if names else "—",
+                inline=True,
+            )
+        accepted_count = len(event["categories"].get("accepted", []))
+        footer_text = f"{FOOTER_BRAND} • Created by {event['creator_name']} • {accepted_count} accepted"
+ 
+    thumbnail = event.get("thumbnail_url")
+    if not thumbnail and event["type"] == EVENT_TYPE_COMPANY:
+        thumbnail = BATTALION_COMPANIES.get(event["company"], {}).get("logo_url")
+    if thumbnail:
+        embed.set_thumbnail(url=thumbnail)
+    if event.get("banner_url"):
+        embed.set_image(url=event["banner_url"])
+ 
+    embed.set_footer(text=footer_text)
+    embed.timestamp = datetime.fromtimestamp(event["created_epoch"], tz=timezone.utc)
+    return embed
+ 
+ 
+# ----- F. Posting a confirmed event + the wizard orchestrator --------------
+ 
+async def post_event(dm_channel, guild, target_channel, event):
+    """Posts the finished event embed to its target channel, wires up
+    reactions (general) or the persistent RSVP view (company), starts
+    tracking it in memory + on disk, and schedules its reminder."""
+    perms = target_channel.permissions_for(guild.me)
+    missing = []
+    if not perms.send_messages:
+        missing.append("Send Messages")
+    if not perms.embed_links:
+        missing.append("Embed Links")
+    if event["type"] == EVENT_TYPE_GENERAL and not perms.add_reactions:
+        missing.append("Add Reactions")
+    if not perms.create_public_threads:
+        missing.append("Create Public Threads")  # needed later, for the 20-minute reminder thread
+    if missing:
+        await dm_channel.send(embed=make_error_embed(
+            "Missing Permissions",
+            f"I'm missing these permissions in {target_channel.mention}: **{', '.join(missing)}**. "
+            "Fix them and run `/event` again — nothing was posted.",
+        ))
+        return
+ 
+    embed = build_event_embed(event)
+    view = EventRSVPView() if event["type"] == EVENT_TYPE_COMPANY else None
+ 
+    try:
+        message = await target_channel.send(embed=embed, view=view)
+    except discord.HTTPException as e:
+        await dm_channel.send(embed=make_error_embed("Failed To Post", f"Discord rejected the event message: {e}"))
+        return
+ 
+    event["message_id"] = message.id
+    active_events[message.id] = event
+ 
+    if event["type"] == EVENT_TYPE_GENERAL:
+        for info in BATTALION_COMPANIES.values():
+            try:
+                await message.add_reaction(_as_emoji(info["emoji"]))
+            except discord.HTTPException as e:
+                # One bad/duplicate emoji shouldn't take the whole event down —
+                # the rest still get added; fix the emoji in BATTALION_COMPANIES
+                # and re-add it manually if this happens.
+                print(f"Could not add reaction {info['emoji']} to event {message.id}: {e}")
+ 
+    await save_events()
+    schedule_event_reminder(event)
+ 
+    success_embed = discord.Embed(
+        title="✅ Event Posted!",
+        description=f"Your event is live in {target_channel.mention}.",
+        color=EMBED_COLOR_SUCCESS,
+    )
+    success_embed.set_footer(text=FOOTER_BRAND)
+    await dm_channel.send(embed=success_embed)
+ 
+ 
+async def run_event_setup(user, guild, origin_channel, dm_channel):
+    """Runs the full multi-step /event wizard entirely inside the user's
+    DMs. Every step can be abandoned early — Cancel button, typing
+    'cancel', or simply not responding (timeout) — and all three paths
+    raise EventSetupCancelled, caught once here so the wizard always
+    stops cleanly with no half-created event left behind."""
+    try:
+        # 1) General or company-specific event?
+        type_view = EventTypeView(author_id=user.id)
+        await send_view(dm_channel, "**What kind of event is this?**", type_view)
+        event_type = await require_view_value(type_view, dm_channel)
+ 
+        # 2) If company-specific, which company?
+        company_key = None
+        if event_type == EVENT_TYPE_COMPANY:
+            company_view = CompanySelectView(author_id=user.id)
+            await send_view(dm_channel, "**Which company is this event for?**", company_view)
+            company_key = await require_view_value(company_view, dm_channel)
+ 
+        # 3) Which channel should it be posted in?
+        channel_view = ChannelChoiceView(author_id=user.id, origin_channel=origin_channel)
+        await send_view(dm_channel, "**Where should this event be posted?**", channel_view)
+        channel_choice = await require_view_value(channel_view, dm_channel)
+ 
+        if channel_choice == "here":
+            target_channel = origin_channel
+        else:
+            target_channel = await prompt_for_text(
+                dm_channel, user.id,
+                "Which channel should I post it in? Mention it (`#channel`), or give its exact name or ID.",
+                validator=lambda text: resolve_channel(guild, text, needs_reactions=(event_type == EVENT_TYPE_GENERAL)),
+            )
+ 
+        # 4) Title (mandatory, max 100 chars)
+        title = await prompt_for_text(dm_channel, user.id, "**Event title?** (max 100 characters)", validator=validate_title)
+ 
+        # 5) Description (optional)
+        description = await prompt_for_text(dm_channel, user.id, "**Event description?**", validator=validate_description, allow_skip=True)
+        if description is EVENT_SKIPPED:
+            description = None
+ 
+        # 6) UTC offset (mandatory — needed to interpret the times below)
+        offset = await prompt_for_text(
+            dm_channel, user.id,
+            "**What's your UTC offset?** (e.g. `+2`, `-5`, `+5:30`, `UTC`)",
+            validator=validate_utc_offset,
+        )
+ 
+        # 7) Start time (mandatory)
+        format_list = "\n".join(f"• `{ex}`" for ex in DATETIME_FORMAT_EXAMPLES)
+        start_epoch = await prompt_for_text(
+            dm_channel, user.id,
+            f"**When does it start?** (your local time — I'll account for your UTC{offset:+g} offset)\n{format_list}",
+            validator=lambda text: validate_datetime(text, offset),
+        )
+ 
+        # 8) End time (optional, must be after the start time)
+        end_epoch = await prompt_for_text(
+            dm_channel, user.id,
+            f"**When does it end?** (same format, optional)\n{format_list}",
+            validator=lambda text: validate_datetime(text, offset, after_epoch=start_epoch),
+            allow_skip=True,
+        )
+        if end_epoch is EVENT_SKIPPED:
+            end_epoch = None
+ 
+        # 9) Banner image (optional — large image at the bottom of the embed)
+        banner_url = await prompt_for_text(
+            dm_channel, user.id, "**Banner image URL?** (large image, shown at the bottom — optional)",
+            validator=validate_url, allow_skip=True,
+        )
+        if banner_url is EVENT_SKIPPED:
+            banner_url = None
+ 
+        # 10) Thumbnail image (optional — small image, top-right of the embed)
+        thumbnail_url = await prompt_for_text(
+            dm_channel, user.id, "**Thumbnail image URL?** (small image, top-right — optional)",
+            validator=validate_url, allow_skip=True,
+        )
+        if thumbnail_url is EVENT_SKIPPED:
+            thumbnail_url = None
+ 
+        member = guild.get_member(user.id)
+        creator_name = member.display_name if member else user.name
+ 
+        event = {
+            "type": event_type,
+            "company": company_key,
+            "title": title,
+            "description": description,
+            "start_epoch": start_epoch,
+            "end_epoch": end_epoch,
+            "banner_url": banner_url,
+            "thumbnail_url": thumbnail_url,
+            "creator_id": user.id,
+            "creator_name": creator_name,
+            "created_epoch": int(datetime.now(timezone.utc).timestamp()),
+            "categories": {},        # filled in as people RSVP
+            "display_names": {},     # {user_id_str: display_name}, cached so the embed never needs a live API call to render
+            "channel_id": target_channel.id,
+            "guild_id": guild.id,
+            "reminder_sent": False,
+            # Snapshotting the emoji map onto the event itself (rather than
+            # always reading BATTALION_COMPANIES live) means an admin can
+            # freely edit the config for FUTURE events without breaking
+            # reaction handling on ones already posted.
+            "emoji_map": {info["emoji"]: key for key, info in BATTALION_COMPANIES.items()} if event_type == EVENT_TYPE_GENERAL else {},
+        }
+ 
+        # 11) Preview + confirm
+        preview_embed = build_event_embed(event)
+        await dm_channel.send(f"**Preview** — this is exactly what will be posted in {target_channel.mention}:", embed=preview_embed)
+        confirm_view = ConfirmView(author_id=user.id)
+        await send_view(dm_channel, "Post it?", confirm_view)
+        await require_view_value(confirm_view, dm_channel)  # only "confirm" reaches this line without raising
+ 
+        # 12) Post it
+        await post_event(dm_channel, guild, target_channel, event)
+ 
+    except EventSetupCancelled:
+        return
+    except discord.Forbidden:
+        await dm_channel.send(embed=make_error_embed(
+            "Missing Permissions", "I ran into a Discord permissions error and had to stop the setup."
+        ))
+    except Exception as e:
+        print(f"Error in /event setup for {user}: {e}")
+        try:
+            await dm_channel.send(embed=make_error_embed(
+                "Something Went Wrong", "An unexpected error occurred and the setup was cancelled. Please try again."
+            ))
+        except discord.Forbidden:
+            pass  # they closed their DMs mid-setup — nothing more we can do
+ 
+ 
+# ----- G. The /event command -------------------------------------------------
+ 
+@bot.tree.command(name="event", description="Create an event for members to RSVP to. Setup happens in your DMs.")
+@require_role()
+async def event_command(interaction: discord.Interaction):
+    # Only one setup wizard per user at a time — otherwise two /event runs
+    # would both be waiting on messages in the same DM channel and very
+    # likely collide, each thinking the other's answers were its own.
+    if interaction.user.id in active_setups:
+        await interaction.response.send_message(
+            embed=make_error_embed(
+                "Setup Already In Progress",
+                "You already have an event setup running in your DMs. Finish or cancel that one first.",
+            ),
+            ephemeral=True,
+        )
+        return
+ 
+    # Remember exactly where the command was called from BEFORE jumping
+    # into DMs — this is what lets the wizard offer "post it back here"
+    # as its default, one-click channel option.
+    origin_channel = interaction.channel
+    guild = interaction.guild
+ 
+    await interaction.response.defer(ephemeral=True)
+ 
+    try:
+        dm_channel = await interaction.user.create_dm()
+        await dm_channel.send(
+            f"👋 Let's set up an event! (Started from **#{origin_channel.name}** in **{guild.name}**.)"
+        )
+    except discord.Forbidden:
+        await interaction.followup.send(
+            embed=make_error_embed(
+                "Can't DM You",
+                "I couldn't send you a DM — please enable direct messages from server members and run `/event` again.",
+            ),
+            ephemeral=True,
+        )
+        return
+    except discord.HTTPException as e:
+        await interaction.followup.send(
+            embed=make_error_embed("Something Went Wrong", f"Couldn't start the DM setup: {e}"),
+            ephemeral=True,
+        )
+        return
+ 
+    await interaction.followup.send(
+        embed=make_embed(interaction, title="📧 Check your DMs to set up the event!", color=EMBED_COLOR_INFO, verb="Requested"),
+        ephemeral=True,
+    )
+ 
+    active_setups.add(interaction.user.id)
+    try:
+        await run_event_setup(interaction.user, guild, origin_channel, dm_channel)
+    finally:
+        active_setups.discard(interaction.user.id)
+ 
+ 
+# ----- H. Persistent RSVP button view (company events) ---------------------
+ 
+class EventRSVPView(discord.ui.View):
+    """Persistent view attached to every company-specific event embed.
+    Registered once in setup_hook via bot.add_view(), so the buttons keep
+    working after a bot restart without the message needing to be
+    resent. Every button routes through _handle(), which figures out
+    which event it belongs to from interaction.message — nothing needs to
+    be encoded in the custom_id."""
+ 
+    def __init__(self):
+        super().__init__(timeout=None)
+ 
+    async def _handle(self, interaction, status_key):
+        try:
+            event = active_events.get(interaction.message.id)
+            if event is None:
+                await interaction.response.send_message(
+                    embed=make_error_embed(
+                        "Event Not Found",
+                        "This event isn't being tracked anymore (it may predate the bot's last restart).",
+                    ),
+                    ephemeral=True,
+                )
+                return
+ 
+            user_id = interaction.user.id
+            if EVENT_RSVP_MUTUALLY_EXCLUSIVE:
+                # A member can only hold ONE RSVP status at a time — picking
+                # a new one clears any previous one automatically.
+                for key in ("accepted", "declined", "tentative"):
+                    if key != status_key:
+                        other_bucket = event["categories"].setdefault(key, [])
+                        if user_id in other_bucket:
+                            other_bucket.remove(user_id)
+ 
+            bucket = event["categories"].setdefault(status_key, [])
+            if user_id in bucket:
+                bucket.remove(user_id)  # clicking your current status again clears it
+            else:
+                bucket.append(user_id)
+            event["display_names"][str(user_id)] = interaction.user.display_name
+ 
+            await interaction.response.edit_message(embed=build_event_embed(event))
+            await save_events()
+        except Exception as e:
+            print(f"Error handling RSVP button ({status_key}): {e}")
+            if not interaction.response.is_done():
+                try:
+                    await interaction.response.send_message(
+                        embed=make_error_embed("Something Went Wrong", "Couldn't update your RSVP — please try again."),
+                        ephemeral=True,
+                    )
+                except discord.HTTPException:
+                    pass
+ 
+    @discord.ui.button(label="Accepted", emoji="✅", style=discord.ButtonStyle.success, custom_id="event_rsvp_accepted")
+    async def accepted_btn(self, interaction, button):
+        await self._handle(interaction, "accepted")
+ 
+    @discord.ui.button(label="Declined", emoji="❌", style=discord.ButtonStyle.danger, custom_id="event_rsvp_declined")
+    async def declined_btn(self, interaction, button):
+        await self._handle(interaction, "declined")
+ 
+    @discord.ui.button(label="Tentative", emoji="❓", style=discord.ButtonStyle.secondary, custom_id="event_rsvp_tentative")
+    async def tentative_btn(self, interaction, button):
+        await self._handle(interaction, "tentative")
+ 
+ 
+# ----- I. Reaction handling (general events) --------------------------------
+ 
+def request_event_refresh(event):
+    """Schedules an embed refresh a short moment from now instead of
+    editing on every single reaction — a burst of people reacting at
+    once (e.g. right when the event goes up) then costs one Discord API
+    call instead of dozens."""
+    message_id = event["message_id"]
+    existing = _pending_refresh_tasks.get(message_id)
+    if existing and not existing.done():
+        return  # a refresh is already queued for this message; nothing more to do
+    _pending_refresh_tasks[message_id] = asyncio.create_task(_debounced_refresh(event))
+ 
+ 
+async def _debounced_refresh(event):
+    try:
+        await asyncio.sleep(EVENT_REFRESH_DEBOUNCE_SECONDS)
+        if event["message_id"] not in active_events:
+            return  # deleted / no longer tracked while we were waiting
+        await refresh_event_message(event)
+        await save_events()
+    except Exception as e:
+        print(f"Error refreshing event {event.get('message_id')}: {e}")
+ 
+ 
+async def refresh_event_message(event):
+    channel = bot.get_channel(event["channel_id"])
+    if channel is None:
+        return
+    try:
+        message = await channel.fetch_message(event["message_id"])
+        await message.edit(embed=build_event_embed(event))
+    except discord.NotFound:
+        active_events.pop(event["message_id"], None)
+    except discord.HTTPException as e:
+        print(f"Could not refresh event message {event['message_id']}: {e}")
+ 
+ 
+async def handle_event_reaction(payload, adding):
+    """Shared logic for on_raw_reaction_add/remove: keeps a GENERAL
+    event's per-company attendance lists in sync with the reactions on
+    its message. Company events use buttons instead (EventRSVPView), so
+    this only ever touches general events."""
+    if payload.user_id == bot.user.id:
+        return  # ignore the bot's own placeholder reactions
+    event = active_events.get(payload.message_id)
+    if event is None or event["type"] != EVENT_TYPE_GENERAL:
+        return
+ 
+    company_key = event["emoji_map"].get(str(payload.emoji))
+    if company_key is None:
+        return  # someone reacted with an unrelated emoji — ignore it
+ 
+    guild = bot.get_guild(event["guild_id"])
+    if guild is None:
+        return
+    try:
+        member = payload.member or guild.get_member(payload.user_id) or await guild.fetch_member(payload.user_id)
+    except discord.NotFound:
+        return  # they reacted then immediately left the server
+ 
+    bucket = event["categories"].setdefault(company_key, [])
+    changed = False
+    if adding and payload.user_id not in bucket:
+        bucket.append(payload.user_id)
+        changed = True
+    elif not adding and payload.user_id in bucket:
+        bucket.remove(payload.user_id)
+        changed = True
+    if not changed:
+        return
+ 
+    event["display_names"][str(payload.user_id)] = member.display_name
+    request_event_refresh(event)
+ 
+ 
+@bot.event
+async def on_raw_reaction_add(payload):
+    try:
+        await handle_event_reaction(payload, adding=True)
+    except Exception as e:
+        print(f"Error handling event reaction add: {e}")
+ 
+ 
+@bot.event
+async def on_raw_reaction_remove(payload):
+    try:
+        await handle_event_reaction(payload, adding=False)
+    except Exception as e:
+        print(f"Error handling event reaction remove: {e}")
+ 
+ 
+@bot.event
+async def on_raw_message_delete(payload):
+    """Stops tracking an event if its message gets deleted, so the bot
+    doesn't keep trying to edit or remind something that no longer
+    exists."""
+    event = active_events.pop(payload.message_id, None)
+    if event is None:
+        return
+    task = reminder_tasks.pop(payload.message_id, None)
+    if task and not task.done():
+        task.cancel()
+    try:
+        await save_events()
+    except Exception as e:
+        print(f"Error saving events after message delete: {e}")
+ 
+ 
+# ----- J. 20-minutes-out reminder thread + ping -----------------------------
+ 
+def schedule_event_reminder(event):
+    """Fires the reminder as a background asyncio task. Safe to call
+    again for an event that already has one scheduled (e.g. on reload
+    from disk at startup) — cancels any previous task first so two
+    timers never race each other."""
+    message_id = event.get("message_id")
+    if message_id is None:
+        return
+    existing = reminder_tasks.get(message_id)
+    if existing and not existing.done():
+        existing.cancel()
+    if event.get("reminder_sent"):
+        return
+ 
+    start_dt = datetime.fromtimestamp(event["start_epoch"], tz=timezone.utc)
+    reminder_dt = start_dt - timedelta(minutes=EVENT_REMINDER_LEAD_MINUTES)
+    delay = (reminder_dt - datetime.now(timezone.utc)).total_seconds()
+    if delay <= 0:
+        # Event starts too soon (or has already started) for a reminder to
+        # make sense — matches the spec: "doesn't apply if the event was
+        # created within 20 minutes from its start."
+        return
+ 
+    reminder_tasks[message_id] = asyncio.create_task(_fire_reminder_after_delay(event, delay))
+ 
+ 
+async def _fire_reminder_after_delay(event, delay):
+    try:
+        await asyncio.sleep(delay)
+        await send_event_reminder(event)
+    except asyncio.CancelledError:
+        pass
+    except Exception as e:
+        print(f"Error firing reminder for event {event.get('message_id')}: {e}")
+ 
+ 
+async def _send_chunked(destination, prefix, mentions, allowed_mentions, chunk_size=1900):
+    """Sends a big block of user mentions across as many messages as
+    needed to stay under Discord's 2000-character limit, instead of
+    letting one giant battalion-wide ping fail outright."""
+    text = " ".join(mentions)
+    first = True
+    while text:
+        chunk = text[:chunk_size]
+        if len(text) > chunk_size:
+            cut = chunk.rfind(" ")
+            if cut > 0:
+                chunk = chunk[:cut]
+        await destination.send((prefix if first else "") + chunk, allowed_mentions=allowed_mentions)
+        text = text[len(chunk):].lstrip()
+        first = False
+ 
+ 
+async def send_event_reminder(event):
+    """Creates a thread under the event message and pings everyone
+    attending: all reacted users for a general event, or Accepted +
+    Tentative for a company event."""
+    message_id = event["message_id"]
+    if message_id not in active_events or event.get("reminder_sent"):
+        return  # deleted, or somehow already handled
+ 
+    channel = bot.get_channel(event["channel_id"])
+    if channel is None:
+        return
+    try:
+        message = await channel.fetch_message(message_id)
+    except (discord.NotFound, discord.HTTPException):
+        return
+ 
+    if event["type"] == EVENT_TYPE_GENERAL:
+        user_ids = sorted({uid for members in event["categories"].values() for uid in members})
+    else:
+        user_ids = sorted(set(event["categories"].get("accepted", [])) | set(event["categories"].get("tentative", [])))
+ 
+    try:
+        thread = await message.create_thread(
+            name=(f"⏰ {event['title']} — Starting Soon")[:100],
+            auto_archive_duration=60,
+        )
+    except discord.HTTPException as e:
+        print(f"Could not create reminder thread for event {message_id}: {e}")
+        return
+ 
+    intro = f"⏰ **{event['title']}** starts in {EVENT_REMINDER_LEAD_MINUTES} minutes!\n"
+    allowed = discord.AllowedMentions(users=True, everyone=False, roles=False)
+    if not user_ids:
+        await thread.send(intro + "No one has RSVP'd yet — see you there anyway!", allowed_mentions=allowed)
+    else:
+        await _send_chunked(thread, intro, [f"<@{uid}>" for uid in user_ids], allowed)
+ 
+    event["reminder_sent"] = True
+    await save_events()
 
 
 bot.run(DISCORD_BOT_TOKEN)
