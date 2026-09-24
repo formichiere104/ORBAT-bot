@@ -39,7 +39,7 @@
 
 
 
-## Customization 🪄
+## Customization 
 >description
 
 
