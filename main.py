@@ -36,6 +36,7 @@ from datetime import datetime, timezone, timedelta
 
 import os
 import json
+from typing import Optional
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -215,6 +216,132 @@ DATETIME_FORMAT_EXAMPLES = [
     "2026-09-26 15:00",
 ]
 
+# ============================================================
+# REQUEST SYSTEM CONFIG  (LOA / Discharge — used by /requestpanel)
+# ============================================================
+# Everything the request system needs to know lives in this block. To
+# change who can do what, add a company, or reword the panel, you should
+# only ever need to edit THIS block — the code further down reads
+# everything from here.
+ 
+# --- Who can do what -----------------------------------------------------
+# Roles allowed to run /requestpanel. Add more role IDs to this set any time.
+REQUEST_PANEL_ROLE_IDS = {
+    1423287377111023679,
+}
+ 
+# Roles allowed to press Accept / Deny on a posted request. Kept SEPARATE
+# from the company table below so you can add extra reviewers (e.g. Warrant
+# Officers) without touching the companies. Add more role IDs any time.
+REQUEST_REVIEWER_ROLE_IDS = {
+    1554139229003452426,  # Company 1 HQ
+    1554139296758505492,  # Company 2 HQ
+    1554139344292421735,  # Company 3 HQ
+}
+ 
+# --- Companies -------------------------------------------------------------
+# company role ID -> the name shown in the "Company" field + that company's
+# HQ role (pinged on discharge requests). Add one line per company.
+# ⚠️ CHECK THE NAMES: I matched them to your role IDs in the order you gave
+# them (Horn, Doom, Viper) — swap them if that's not the right order.
+REQUEST_COMPANIES = {
+    1554139371647533127: {"name": "Horn Company",  "hq_role_id": 1554139229003452426},
+    1554139402488389693: {"name": "Doom Company",  "hq_role_id": 1554139296758505492},
+    1554139434318962868: {"name": "Viper Company", "hq_role_id": 1554139344292421735},
+}
+# Shown when the submitter has NO company role, or MORE THAN ONE (no HQ is pinged then).
+REQUEST_COMPANY_FALLBACK = "N/A"
+ 
+# --- Request types -----------------------------------------------------------
+# Each entry becomes one panel button, one DM format and one embed layout.
+# "fields" is the form, in order. For each field:
+#   key      internal name (don't change once requests exist in the log)
+#   label    the text before the ":" in the DM format AND the embed field name
+#   hint     the "(State your ...)" help text shown in the DM
+#   inline   True = small column in the embed, False = full-width row
+#   max_len  longest accepted answer (Discord caps embed fields at 1024)
+REQUEST_TYPES = {
+    "loa": {
+        "prefix": "LOA",                              # request IDs look like LOA-0001
+        "short_name": "Leave of Absence",
+        "title": "📝 Leave of Absence Request",
+        "channel_id": 1554138318839742505,            # where finished requests are posted
+        "ping_hq": False,                             # ping the submitter's company HQ on post?
+        "pending_color": 0x5865F2,                    # embed color while waiting for review
+        "button_label": "Request LOA",
+        "button_emoji": "📝",
+        "button_style": discord.ButtonStyle.primary,
+        "fields": [
+            {"key": "discord_username", "label": "Discord Username", "hint": "State your Discord username", "inline": True,  "max_len": 64},
+            {"key": "username",         "label": "Username",         "hint": "State your Username",         "inline": True,  "max_len": 100},
+            {"key": "rank",             "label": "Rank",             "hint": "State your rank",             "inline": True,  "max_len": 50},
+            {"key": "duration",         "label": "Duration",         "hint": "State the Duration of your Leave Of Absence", "inline": False, "max_len": 100},
+            {"key": "reason",           "label": "Reason",           "hint": "State your reason",           "inline": False, "max_len": 1000},
+        ],
+    },
+    "discharge": {
+        "prefix": "DIS",
+        "short_name": "Discharge",
+        "title": "🚪 Discharge Request",
+        "channel_id": 1554138803030065162,
+        "ping_hq": True,
+        "pending_color": 0xED4245,
+        "button_label": "Request Discharge",
+        "button_emoji": "🚪",
+        "button_style": discord.ButtonStyle.danger,
+        "fields": [
+            {"key": "discord_username", "label": "Discord Username", "hint": "State your Discord username", "inline": True,  "max_len": 64},
+            {"key": "username",         "label": "Username/Name",    "hint": "State your Username",         "inline": True,  "max_len": 100},
+            {"key": "rank",             "label": "Rank",             "hint": "State your rank",             "inline": True,  "max_len": 50},
+            {"key": "reason",           "label": "Reason",           "hint": "State your reason",           "inline": False, "max_len": 1000},
+        ],
+    },
+}
+ 
+# --- Behaviour & look ----------------------------------------------------------
+REQUESTS_LOG_FILE = "requests_log.json"       # every filed request + its status, persisted here
+REQUEST_SESSION_TIMEOUT_SECONDS = 30 * 60     # how long the DM format stays open
+REQUEST_DENY_REASON_MAX = 500                 # max length of the denial reason
+REQUEST_FOOTER = "442nd Battalion • Requests" # footer of the DM format embeds
+# True  = the "Discord Username" field is always the submitter's REAL Discord
+#         username (nobody can file a request in someone else's name).
+# False = whatever they typed is used.
+REQUEST_FORCE_REAL_DISCORD_USERNAME = True
+ 
+REQUEST_PENDING_TEXT = "🕓 Pending review"
+REQUEST_STATUS_STYLES = {
+    "accepted": {"emoji": "✅", "label": "Accepted", "color": 0x57F287},
+    "denied":   {"emoji": "❌", "label": "Denied",   "color": 0x4F545C},
+}
+ 
+# The three embeds shown on the panel (edit the text freely).
+REQUEST_PANEL_EMBEDS = [
+    {
+        "title": "Discharge and Leave of Absence Requests",
+        "description": (
+            "Discharges and Leave of Absences are handled by **Warrant Officers**.\n"
+            "A Leave of Absence longer than **one month** must be approved by your respective **Captain**."
+        ),
+        "color": 0x2D5A27,
+    },
+    {
+        "title": "READ BEFORE REQUESTING",
+        "description": (
+            "• Before discharging you must have been in the 442nd for more than **14 days**. "
+            "If you discharge without approval you will be **flagged** and may be **blacklisted** from the battalion.\n\n"
+            "• Leave of Absences longer than **one month** must be approved by your respective **Captain**."
+        ),
+        "color": 0x2D5A27,
+    },
+    {
+        "title": "442nd Requests",
+        "description": (
+            "Need to log an **LOA** or request a **Discharge**? Tap a button below and the bot will "
+            "**DM you the format** to fill out.\nYour request is sent to command for review."
+        ),
+        "color": 0x57F287,
+    },
+]
 
 
 # ============================================================
@@ -719,6 +846,16 @@ class MyBot(commands.Bot):
         for event in active_events.values():
             schedule_event_reminder(event)
         print(f"Loaded {len(active_events)} tracked event(s) from disk.")
+
+        # Same idea for the LOA/Discharge request system: reload the log so
+        # numbering + history survive a restart, and re-register its two
+        # persistent views (panel buttons + Accept/Deny) so they keep
+        # working on already-posted messages without being resent.
+        load_requests()
+        self.add_view(RequestPanelView())
+        self.add_view(RequestReviewView())
+        print(f"Loaded {len(request_log)} logged request(s) from disk.")
+
 
 
         guild = discord.Object(id=GUILD_ID)
@@ -2341,6 +2478,650 @@ async def send_event_reminder(event):
  
     event["reminder_sent"] = True
     await save_events()
+
+# ============================================================
+# REQUEST SYSTEM  (/requestpanel + LOA / Discharge buttons)
+# ============================================================
+# How it works, end to end:
+#   1. A staff member runs /requestpanel -> the bot posts the info embeds
+#      plus one button per request type (built from REQUEST_TYPES).
+#   2. Someone clicks a button -> the bot DMs them the format to fill in.
+#   3. They reply with ONE message. The parser checks it; on any mistake
+#      they get a precise error and can simply try again (until it expires
+#      or they type "cancel").
+#   4. A valid request gets an ID (LOA-0001 / DIS-0001 ...), is written to
+#      the log file, and is posted in the right channel with Accept / Deny
+#      buttons. Discharge requests also ping the submitter's company HQ.
+#   5. A reviewer (REQUEST_REVIEWER_ROLE_IDS) presses Accept, or Deny (which
+#      opens a pop-up asking for the reason). The embed updates in place and
+#      the buttons disappear.
+#
+# API-usage notes (why this is cheap):
+#   • No Google Sheets calls at all.
+#   • Roles/permissions are read from the interaction payload — zero fetches.
+#   • Reviews edit the message through the interaction response itself,
+#     so there's no extra fetch_message / edit call.
+#   • The log is written atomically in a background thread, only when
+#     something actually changed.
+#
+# Layout of this section:
+#   A. In-memory state + JSON log persistence
+#   B. Small helpers (permissions, company lookup, IDs, time)
+#   C. Embed builders (DM format, posted request, panel)
+#   D. Format parser (the "handle every wrong format" part)
+#   E. The DM session behind the panel buttons
+#   F. Posting a validated request
+#   G. Accept / Deny (persistent view + deny-reason modal)
+#   H. Panel view + the /requestpanel command
+ 
+ 
+# ----- A. State + persistence ------------------------------------------------
+ 
+request_log = {}              # {request_id: record} — the full log, mirrored to REQUESTS_LOG_FILE
+request_message_index = {}    # {message_id: request_id} — lets a button click find its request instantly
+request_counters = {}         # {prefix: last number used} — e.g. {"LOA": 10, "DIS": 16}
+active_request_sessions = set()   # user_ids currently filling a form in their DMs (one at a time each)
+_requests_write_lock = asyncio.Lock()  # stops two saves from writing the file at the same moment
+ 
+ 
+def _write_requests_file(snapshot_json):
+    """Runs in a background thread. Writes to a temp file first and then
+    swaps it in, so a crash mid-write can never leave a half-written log."""
+    tmp_path = REQUESTS_LOG_FILE + ".tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        f.write(snapshot_json)
+    os.replace(tmp_path, REQUESTS_LOG_FILE)
+ 
+ 
+async def save_requests():
+    """Persists the log. The JSON string is built HERE (on the event loop,
+    a few ms) and only the file write goes to a thread — this way another
+    request can't modify the dict while it is being serialized."""
+    async with _requests_write_lock:
+        try:
+            snapshot = json.dumps(request_log, indent=2, ensure_ascii=False)
+            await asyncio.to_thread(_write_requests_file, snapshot)
+        except OSError as e:
+            print(f"Failed to save requests to {REQUESTS_LOG_FILE}: {e}")
+ 
+ 
+def load_requests():
+    """Loads the log at startup and rebuilds the message index + ID counters
+    from it, so numbering carries on where it left off after a restart."""
+    if not os.path.exists(REQUESTS_LOG_FILE):
+        return
+    try:
+        with open(REQUESTS_LOG_FILE, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+    except (json.JSONDecodeError, OSError) as e:
+        # Keep the unreadable file as a backup instead of silently overwriting it on the next save.
+        print(f"Could not read {REQUESTS_LOG_FILE} ({e}); keeping it as .corrupt and starting fresh.")
+        try:
+            os.replace(REQUESTS_LOG_FILE, REQUESTS_LOG_FILE + ".corrupt")
+        except OSError:
+            pass
+        return
+ 
+    request_log.update(raw)
+    for request_id, record in raw.items():
+        prefix, _, number = request_id.rpartition("-")
+        request_counters[prefix] = max(request_counters.get(prefix, 0), safe_int(number))
+        if record.get("message_id"):
+            request_message_index[record["message_id"]] = request_id
+ 
+ 
+# ----- B. Small helpers ------------------------------------------------------
+ 
+def now_epoch():
+    return int(datetime.now(timezone.utc).timestamp())
+ 
+ 
+def member_has_any_role(member, role_ids):
+    """True if `member` holds at least one role whose ID is in `role_ids`.
+    (False in DMs, where there are no roles.)"""
+    return isinstance(member, discord.Member) and any(role.id in role_ids for role in member.roles)
+ 
+ 
+def require_roles(role_ids):
+    """Like require_role(), but for a specific set of role IDs. The set is
+    read on every call, so editing it in the config block is all it takes.
+    A failure lands in on_app_command_error as the usual 'Permission Denied'."""
+    async def predicate(interaction: discord.Interaction) -> bool:
+        return member_has_any_role(interaction.user, role_ids)
+    return app_commands.check(predicate)
+ 
+ 
+def resolve_company(member):
+    """Looks at the member's roles and returns (company_name, hq_role_id).
+    Exactly ONE matching company role -> that company + its HQ role.
+    Zero or several -> (REQUEST_COMPANY_FALLBACK, None), i.e. "N/A" and no HQ ping."""
+    member_role_ids = {role.id for role in member.roles}
+    matches = [info for role_id, info in REQUEST_COMPANIES.items() if role_id in member_role_ids]
+    if len(matches) == 1:
+        return matches[0]["name"], matches[0]["hq_role_id"]
+    return REQUEST_COMPANY_FALLBACK, None
+ 
+ 
+def next_request_id(kind):
+    """Hands out the next ID for this request type: LOA-0011, DIS-0017 ...
+    (No await in here, so two requests can never receive the same number.)"""
+    prefix = REQUEST_TYPES[kind]["prefix"]
+    number = request_counters.get(prefix, 0) + 1
+    request_counters[prefix] = number
+    return f"{prefix}-{number:04d}"
+ 
+ 
+def release_request_id(request_id):
+    """Gives an ID back if posting failed, so numbering has no gaps
+    (only if nobody else took a newer number in the meantime)."""
+    prefix, _, number = request_id.rpartition("-")
+    if request_counters.get(prefix) == safe_int(number):
+        request_counters[prefix] = safe_int(number) - 1
+ 
+ 
+def get_request_channel(kind):
+    """The channel this request type is posted in, or None if it doesn't
+    exist / the bot can't post there. Uses the cache — no API call."""
+    channel = bot.get_channel(REQUEST_TYPES[kind]["channel_id"])
+    if not isinstance(channel, discord.TextChannel):
+        return None
+    perms = channel.permissions_for(channel.guild.me)
+    if not (perms.view_channel and perms.send_messages and perms.embed_links):
+        return None
+    return channel
+ 
+ 
+# ----- C. Embed builders -------------------------------------------------------
+ 
+def format_template(kind, discord_username):
+    """The fill-in-the-blanks text: one 'Label:' line per field, with the
+    person's Discord username already filled in."""
+    lines = []
+    for field in REQUEST_TYPES[kind]["fields"]:
+        prefill = f" {discord_username}" if field["key"] == "discord_username" else ""
+        lines.append(f"{field['label']}:{prefill}")
+    return "\n".join(lines)
+ 
+ 
+def build_format_embed(kind, discord_username, errors=None):
+    """The embed DM'd to the requester. With `errors`, it becomes the
+    'invalid format' reply: the same template again, plus what was wrong."""
+    cfg = REQUEST_TYPES[kind]
+    template = f"```\n{format_template(kind, discord_username)}\n```"
+ 
+    if errors:
+        problems = "\n".join(f"• {e}" for e in errors)
+        embed = discord.Embed(
+            title="❌ Invalid Format",
+            description=(
+                f"{problems}\n\n**Fix it and send the whole format again as one message:**\n{template}\n"
+                "Type `cancel` to stop."
+            ),
+            color=EMBED_COLOR_ERROR,
+        )
+    else:
+        hints = "\n".join(f"**{f['label']}:** ({f['hint']})" for f in cfg["fields"])
+        embed = discord.Embed(
+            title=f"{cfg['title']} — Format",
+            description=(
+                f"{hints}\n\n**Copy the format below, fill it out and send it here as one message:**\n{template}\n"
+                f"Type `cancel` to stop. This request expires in **{REQUEST_SESSION_TIMEOUT_SECONDS // 60} minutes**."
+            ),
+            color=cfg["pending_color"],
+        )
+    embed.set_footer(text=REQUEST_FOOTER)
+    return embed
+ 
+ 
+def build_request_embed(record):
+    """Builds the posted request embed from a log record. Used for the
+    first post AND for the in-place update after Accept/Deny, so both
+    always match. Everything it needs is stored in the record, so it never
+    has to look anything up from Discord."""
+    cfg = REQUEST_TYPES[record["type"]]
+    status = record["status"]
+    style = REQUEST_STATUS_STYLES.get(status)
+ 
+    embed = discord.Embed(title=cfg["title"], color=style["color"] if style else cfg["pending_color"])
+    embed.set_author(name=record["submitter_name"], icon_url=record["submitter_icon"])
+ 
+    # The form answers, laid out exactly as configured (inline vs full-width).
+    for field in cfg["fields"]:
+        embed.add_field(name=field["label"], value=truncate_field(record["fields"].get(field["key"])), inline=field["inline"])
+ 
+    embed.add_field(name="Company", value=record["company"], inline=True)
+    embed.add_field(name="Submitted by", value=f"<@{record['submitter_id']}>", inline=True)
+    embed.add_field(name="Submitted", value=f"<t:{record['submitted_epoch']}:f>", inline=True)
+ 
+    if style:
+        status_text = f"{style['emoji']} **{style['label']}** by <@{record['reviewer_id']}> • <t:{record['reviewed_epoch']}:f>"
+    else:
+        status_text = REQUEST_PENDING_TEXT
+    embed.add_field(name="Status", value=status_text, inline=False)
+ 
+    if status == "denied":
+        embed.add_field(name="Denial Reason", value=truncate_field(record.get("denial_reason")), inline=False)
+ 
+    embed.set_footer(text=f"Request ID: {record['id']}")
+    # Timestamp = when it was last touched (submitted, then reviewed).
+    embed.timestamp = datetime.fromtimestamp(record.get("reviewed_epoch") or record["submitted_epoch"], tz=timezone.utc)
+    return embed
+ 
+ 
+def build_panel_embeds():
+    return [
+        discord.Embed(title=e["title"], description=e["description"], color=e["color"])
+        for e in REQUEST_PANEL_EMBEDS
+    ]
+ 
+ 
+# ----- D. Format parser ----------------------------------------------------------
+ 
+def _normalize_label(text):
+    """'  **Username / Name** ' -> 'username/name' — so harmless differences
+    in case, spacing or bold/italic markers don't count as mistakes."""
+    return re.sub(r"[\s*_`]+", "", text).lower()
+ 
+ 
+def parse_request_message(text, cfg):
+    """
+    Turns the user's reply into {field_key: value}.
+    Returns (values, errors): `errors` is a list of plain-language problems
+    (empty when everything is fine), so the user can fix ALL of them in one go
+    instead of being told about one mistake at a time.
+ 
+    Rules:
+      • A line 'Label: value' starts a field (label matching is forgiving).
+      • Any other line continues the previous field, so a multi-line Reason
+        works, and so does 'Reason:' followed by the answer on the next line.
+      • A pasted code block (```) is fine — the fences are stripped.
+    Caught mistakes: text before the first field, a field written twice,
+    missing fields, empty fields, answers that are too long.
+    """
+    fields = cfg["fields"]
+    by_label = {_normalize_label(f["label"]): f for f in fields}
+    text = re.sub(r"```[a-zA-Z]*", "", text)  # drop code-fence markers if the format was pasted as a block
+ 
+    chunks = {f["key"]: [] for f in fields}   # raw lines collected per field
+    seen, duplicates = set(), []
+    current = None   # None = no field started yet | False = inside a duplicated field (ignored) | str = active field key
+    stray_text = False
+ 
+    for line in text.replace("\r", "").split("\n"):
+        head, sep, rest = line.partition(":")
+        field = by_label.get(_normalize_label(head)) if sep else None
+ 
+        if field:                                    # a 'Label:' line
+            if field["key"] in seen:
+                if field["label"] not in duplicates:
+                    duplicates.append(field["label"])
+                current = False
+                continue
+            seen.add(field["key"])
+            current = field["key"]
+            chunks[current].append(rest)
+        elif current is None:                        # text before any field
+            if line.strip():
+                stray_text = True
+        elif current:                                # continuation of the current field
+            chunks[current].append(line)
+ 
+    errors, missing, empty, values = [], [], [], {}
+    if stray_text:
+        errors.append("There is text **before** the first field — put everything inside the format.")
+    if duplicates:
+        errors.append("These fields appear more than once: " + ", ".join(f"**{d}**" for d in duplicates) + ".")
+ 
+    for field in fields:
+        if field["key"] not in seen:
+            missing.append(field["label"])
+            continue
+        value = "\n".join(chunks[field["key"]]).strip()
+        if not value:
+            empty.append(field["label"])
+        elif len(value) > field["max_len"]:
+            errors.append(f"**{field['label']}** is too long ({len(value)}/{field['max_len']} characters).")
+        else:
+            values[field["key"]] = value
+ 
+    if missing:
+        errors.append("Missing field(s): " + ", ".join(f"**{m}**" for m in missing) + " — keep the labels exactly as in the format.")
+    if empty:
+        errors.append("These fields are empty: " + ", ".join(f"**{e}**" for e in empty) + ".")
+ 
+    return (None if errors else values), errors
+ 
+ 
+# ----- E. The DM session (behind the panel buttons) -----------------------------
+ 
+async def collect_request_form(user, dm_channel, kind):
+    """Waits (up to the session timeout, measured from when the format was
+    sent — NOT reset by each attempt) for a valid reply. Returns the parsed
+    values, or None if the user cancelled / it expired."""
+    cfg = REQUEST_TYPES[kind]
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + REQUEST_SESSION_TIMEOUT_SECONDS
+ 
+    def is_reply(message):
+        return message.author.id == user.id and message.channel.id == dm_channel.id
+ 
+    while True:
+        try:
+            message = await bot.wait_for("message", check=is_reply, timeout=max(0, deadline - loop.time()))
+        except asyncio.TimeoutError:
+            await dm_channel.send(embed=make_error_embed(
+                "Request Expired", "You took too long, so this request was cancelled. Press the button again to start over."
+            ))
+            return None
+ 
+        content = message.content.strip()
+        if content.lower() == "cancel":
+            await dm_channel.send(embed=make_error_embed("Request Cancelled", "No request was submitted."))
+            return None
+ 
+        if not content:  # e.g. they sent only an image/file
+            errors = ["I didn't receive any text. Please send the format as a normal text message."]
+            values = None
+        else:
+            values, errors = parse_request_message(content, cfg)
+ 
+        if values is not None:
+            return values
+        await dm_channel.send(embed=build_format_embed(kind, user.name, errors=errors))
+        # ...and loop: wait for their corrected message.
+ 
+ 
+async def start_request_session(interaction, kind):
+    """Runs when a panel button is clicked."""
+    cfg = REQUEST_TYPES[kind]
+    user = interaction.user
+ 
+    # 1) Only one open form per person (two would fight over the same DM replies).
+    if user.id in active_request_sessions:
+        await interaction.response.send_message(
+            embed=make_error_embed(
+                "Request Already In Progress",
+                "You already have a request waiting in your DMs. Finish it, or type `cancel` there first.",
+            ),
+            ephemeral=True,
+        )
+        return
+ 
+    # 2) Fail early (before the user wastes time on a form) if the destination is broken.
+    if get_request_channel(kind) is None:
+        await interaction.response.send_message(
+            embed=make_error_embed(
+                "Requests Unavailable",
+                "I can't post to the requests channel right now. Please tell a member of command.",
+            ),
+            ephemeral=True,
+        )
+        return
+ 
+    active_request_sessions.add(user.id)  # no await since the check above -> can't be double-clicked past
+    try:
+        # 3) Acknowledge inside Discord's 3-second window, then DM the format.
+        await interaction.response.defer(ephemeral=True)
+        try:
+            dm_message = await user.send(embed=build_format_embed(kind, user.name))
+        except discord.Forbidden:
+            await interaction.followup.send(
+                embed=make_error_embed(
+                    "Can't DM You",
+                    "I couldn't send you a DM. Enable direct messages from server members, then press the button again.",
+                ),
+                ephemeral=True,
+            )
+            return
+        except discord.HTTPException as e:
+            await interaction.followup.send(
+                embed=make_error_embed("Something Went Wrong", f"Couldn't start the request: {e}"), ephemeral=True
+            )
+            return
+ 
+        await interaction.followup.send(f"📬 Check your DMs — I sent you the **{cfg['short_name']}** format.", ephemeral=True)
+ 
+        # 4) Snapshot everything we need from the member NOW (their roles come
+        #    straight from the click, so no extra API call is needed later).
+        company, hq_role_id = resolve_company(user)
+        submitter = {
+            "id": user.id,
+            "username": user.name,                # e.g. "whov2"
+            "display_name": user.display_name,    # server nickname, e.g. CT-5026 "Rhombus"
+            "icon": user.display_avatar.url,
+        }
+ 
+        # 5) Wait for a valid form, then submit it.
+        values = await collect_request_form(user, dm_message.channel, kind)
+        if values is not None:
+            await submit_request(dm_message.channel, kind, values, submitter, company, hq_role_id, user.guild.id)
+    except Exception as e:
+        print(f"Error in request session for {user}: {e}")
+    finally:
+        active_request_sessions.discard(user.id)  # always free the slot, whatever happened
+ 
+ 
+# ----- F. Posting a validated request ---------------------------------------------
+ 
+async def submit_request(dm_channel, kind, values, submitter, company, hq_role_id, guild_id):
+    """Creates the record + ID, posts it (pinging HQ if configured), logs it,
+    and tells the submitter."""
+    cfg = REQUEST_TYPES[kind]
+    channel = get_request_channel(kind)
+    if channel is None:  # became unavailable while they were filling the form
+        await dm_channel.send(embed=make_error_embed(
+            "Couldn't Submit", "The requests channel is unavailable right now. Please tell a member of command."
+        ))
+        return
+ 
+    if REQUEST_FORCE_REAL_DISCORD_USERNAME and "discord_username" in values:
+        values["discord_username"] = submitter["username"]  # can't be spoofed
+ 
+    request_id = next_request_id(kind)
+    record = {
+        "id": request_id,
+        "type": kind,
+        "status": "pending",
+        "fields": values,
+        "company": company,
+        "hq_role_id": hq_role_id,
+        "submitter_id": submitter["id"],
+        "submitter_name": submitter["display_name"],
+        "submitter_icon": submitter["icon"],
+        "submitted_epoch": now_epoch(),
+        "reviewer_id": None,
+        "reviewed_epoch": None,
+        "denial_reason": None,
+        "message_id": None,
+        "channel_id": channel.id,
+        "guild_id": guild_id,
+    }
+    request_log[request_id] = record
+ 
+    # Only pings the HQ role (nothing else) when this type wants it AND the company was identified.
+    ping_content, allowed = None, discord.AllowedMentions.none()
+    if cfg["ping_hq"] and hq_role_id:
+        ping_content = f"<@&{hq_role_id}>"
+        allowed = discord.AllowedMentions(roles=[discord.Object(id=hq_role_id)])
+ 
+    try:
+        message = await channel.send(
+            content=ping_content, embed=build_request_embed(record), view=RequestReviewView(), allowed_mentions=allowed
+        )
+    except discord.HTTPException as e:
+        request_log.pop(request_id, None)  # nothing was posted -> undo, keep the log and numbering clean
+        release_request_id(request_id)
+        print(f"Could not post {request_id}: {e}")
+        await dm_channel.send(embed=make_error_embed(
+            "Couldn't Submit", "Discord rejected the request message. Please tell a member of command."
+        ))
+        return
+ 
+    record["message_id"] = message.id
+    request_message_index[message.id] = request_id
+    await save_requests()
+ 
+    await dm_channel.send(embed=discord.Embed(
+        title="✅ Request Submitted",
+        description=f"Your **{cfg['short_name']}** request was sent to command for review.\n**Request ID:** `{request_id}`",
+        color=EMBED_COLOR_SUCCESS,
+    ))
+    print(f"Posted {request_id} ({company}).")
+ 
+ 
+# ----- G. Accept / Deny -------------------------------------------------------------
+ 
+async def finalize_review(interaction, record, decision, reason=None):
+    """Applies Accept/Deny: updates the record, edits the message in place
+    (buttons removed), and saves the log."""
+    # The status check and the update below have no `await` between them,
+    # so two reviewers clicking at once can't both succeed.
+    if record["status"] != "pending":
+        await interaction.response.send_message(
+            embed=make_error_embed("Already Reviewed", "Someone else already handled this request."), ephemeral=True
+        )
+        return
+ 
+    record.update(status=decision, reviewer_id=interaction.user.id, reviewed_epoch=now_epoch(), denial_reason=reason)
+    try:
+        # Editing through the interaction response = no extra fetch/edit API calls.
+        await interaction.response.edit_message(embed=build_request_embed(record), view=None)
+    except discord.HTTPException as e:
+        record.update(status="pending", reviewer_id=None, reviewed_epoch=None, denial_reason=None)  # undo
+        print(f"Could not update {record['id']}: {e}")
+        return
+    await save_requests()
+    print(f"{record['id']} {decision} by {interaction.user}.")
+ 
+ 
+class DenyReasonModal(discord.ui.Modal, title="Deny Request"):
+    """Pop-up shown when a reviewer presses Deny — collects the reason."""
+    reason = discord.ui.TextInput(
+        label="Denial reason",
+        style=discord.TextStyle.paragraph,
+        placeholder="Why is this request being denied?",
+        required=True,
+        max_length=REQUEST_DENY_REASON_MAX,
+    )
+ 
+    async def on_submit(self, interaction: discord.Interaction):
+        # Re-check everything: the modal can sit open for a while.
+        record = await RequestReviewView.authorize(interaction)
+        if record is not None:
+            await finalize_review(interaction, record, "denied", reason=self.reason.value.strip())
+ 
+ 
+class RequestReviewView(discord.ui.View):
+    """Persistent Accept / Deny buttons on every posted request. Registered
+    once in setup_hook, so they keep working after a restart. The request is
+    found from the message the button sits on — nothing is stored in the custom_id."""
+ 
+    def __init__(self):
+        super().__init__(timeout=None)
+ 
+    @staticmethod
+    async def authorize(interaction):
+        """Shared gate for both buttons and the modal. Returns the request's
+        record if the clicker may review it, otherwise replies with the
+        reason (privately) and returns None."""
+        if not member_has_any_role(interaction.user, REQUEST_REVIEWER_ROLE_IDS):
+            await interaction.response.send_message(
+                embed=make_error_embed("Permission Denied", "Only HQ can accept or deny requests."), ephemeral=True
+            )
+            return None
+        # interaction.message is the message the button/modal was attached
+        # to; discord.py carries it through from the button click into the
+        # deny-reason modal's on_submit too. Guarded here just in case a
+        # future discord.py version ever stops attaching it.
+        if interaction.message is None:
+            await interaction.response.send_message(
+                embed=make_error_embed("Something Went Wrong", "Couldn't tell which request this was for — please try again."),
+                ephemeral=True,
+            )
+            return None
+        record = request_log.get(request_message_index.get(interaction.message.id))
+        if record is None:
+            await interaction.response.send_message(
+                embed=make_error_embed("Request Not Found", "This request isn't in the log (was the log file deleted?)."),
+                ephemeral=True,
+            )
+            return None
+        if record["status"] != "pending":
+            await interaction.response.send_message(
+                embed=make_error_embed("Already Reviewed", "This request has already been handled."), ephemeral=True
+            )
+            return None
+        return record
+ 
+    @discord.ui.button(label="Accept", emoji="✅", style=discord.ButtonStyle.success, custom_id="request_review_accept")
+    async def accept_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        record = await self.authorize(interaction)
+        if record is not None:
+            await finalize_review(interaction, record, "accepted")
+ 
+    @discord.ui.button(label="Deny", emoji="❌", style=discord.ButtonStyle.danger, custom_id="request_review_deny")
+    async def deny_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        # Permission is checked BEFORE the pop-up, so unauthorized users never see it.
+        if await self.authorize(interaction) is not None:
+            await interaction.response.send_modal(DenyReasonModal())
+ 
+ 
+# ----- H. Panel view + /requestpanel ----------------------------------------------------
+ 
+class RequestPanelView(discord.ui.View):
+    """The buttons under the panel. They are generated from REQUEST_TYPES,
+    so adding a new request type there adds its button automatically.
+    Persistent (registered in setup_hook): survives restarts."""
+ 
+    def __init__(self):
+        super().__init__(timeout=None)
+        for kind, cfg in REQUEST_TYPES.items():
+            button = discord.ui.Button(
+                label=cfg["button_label"],
+                emoji=cfg["button_emoji"],
+                style=cfg["button_style"],
+                custom_id=f"request_panel:{kind}",
+            )
+            button.callback = self._make_callback(kind)
+            self.add_item(button)
+ 
+    @staticmethod
+    def _make_callback(kind):
+        async def callback(interaction: discord.Interaction):
+            await start_request_session(interaction, kind)
+        return callback
+ 
+ 
+@bot.tree.command(name="requestpanel", description="Post the LOA / Discharge request panel.")
+@app_commands.describe(channel="Where to post the panel (defaults to this channel).")
+@require_roles(REQUEST_PANEL_ROLE_IDS)
+async def requestpanel(interaction: discord.Interaction, channel: Optional[discord.TextChannel] = None):
+    target = channel or interaction.channel
+ 
+    # Check the bot can actually post there BEFORE trying.
+    perms = target.permissions_for(interaction.guild.me)
+    if not (perms.view_channel and perms.send_messages and perms.embed_links):
+        await interaction.response.send_message(
+            embed=make_error_embed(
+                "Missing Permissions", f"I need **View Channel, Send Messages and Embed Links** in {target.mention}."
+            ),
+            ephemeral=True,
+        )
+        return
+ 
+    await interaction.response.defer(ephemeral=True)
+    try:
+        await target.send(embeds=build_panel_embeds(), view=RequestPanelView())
+    except discord.HTTPException as e:
+        await interaction.followup.send(
+            embed=make_error_embed("Failed To Post", f"Discord rejected the panel: {e}"), ephemeral=True
+        )
+        return
+ 
+    await interaction.followup.send(
+        embed=make_embed(interaction, title=f"✅ Request panel posted in #{target.name}", color=EMBED_COLOR_SUCCESS, verb="Updated"),
+        ephemeral=True,
+    )
 
 
 bot.run(DISCORD_BOT_TOKEN)

@@ -4,3 +4,4 @@ __pycache__/
 venv/
 .venv/
 events_data.json
+requests_log.json
