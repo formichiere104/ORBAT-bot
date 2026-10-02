@@ -25,6 +25,9 @@ from discord.ext import commands
 import gspread
 from google.oauth2.service_account import Credentials
 from gspread.cell import Cell
+from gspread.utils import a1_to_rowcol, rowcol_to_a1
+from gspread.exceptions import APIError
+
 
 # MISC IMPORTS
 import requests
@@ -3122,6 +3125,439 @@ async def requestpanel(interaction: discord.Interaction, channel: Optional[disco
         embed=make_embed(interaction, title=f"✅ Request panel posted in #{target.name}", color=EMBED_COLOR_SUCCESS, verb="Updated"),
         ephemeral=True,
     )
+
+# ============================================================
+# DISCHARGE SYSTEM  (/discharge)
+# ============================================================
+
+# ----- CONFIG ---------------------------------------------------------------
+
+# Sheet names. They must match the tab names EXACTLY.
+DISCHARGE_SHEET_NAME = "442nd DISCHARGE"
+DISCHARGE_SCHOOL_SHEET_NAME = "442nd SCHOOL"
+ 
+# Every sheet we search stores the roblox username in this column.
+SHEET_USERNAME_COL = "D"
+ 
+# First row of the DISCHARGE sheet that can hold an entry.
+DISCHARGE_FIRST_DATA_ROW = 10
+ 
+# Which column of the DISCHARGE sheet receives which value.
+# (Add / move columns here; the code writes each one individually.)
+DISCHARGE_LOG_COLUMNS = {
+    "designation": "C",   # CT number + nickname, taken from the Data sheet
+    "username":    "D",
+    "date":        "E",   # date of the discharge
+    "type":        "F",   # Honorable / Dishonorable / PURGED
+    "reason":      "G",
+    "signature":   "H",   # server nickname of whoever ran the command
+}
+DISCHARGE_DATE_FORMAT = "%d/%m/%Y"   # DD/MM/YYYY
+DISCHARGE_REASON_MAX = 500           # max characters accepted for the reason
+ 
+# Dropdown 1: companies. key -> label shown in Discord + the sheet to clean.
+# To add a company: add one line here, nothing else needs to change.
+DISCHARGE_COMPANIES = {
+    "horn":      {"label": "Horn",      "sheet": "442nd HORN"},
+    "doom":      {"label": "Doom",      "sheet": "442nd DOOM"},
+    "manticore": {"label": "Manticore", "sheet": "442nd MANTICORE"},
+    "viper":     {"label": "Viper",     "sheet": "442nd VIPER"},
+    "hq":        {"label": "Havoc/HQ",  "sheet": "442nd HQ"},   # the HQ sheet also holds the Havoc members
+}
+ 
+# Dropdown 2: discharge types. The KEY is the exact text written in the sheet.
+DISCHARGE_TYPES = {
+    "Honorable":    {"emoji": "🟢", "color": EMBED_COLOR_SUCCESS},
+    "Dishonorable": {"emoji": "🟠", "color": EMBED_COLOR_GOLD},
+    "PURGED":       {"emoji": "🔴", "color": EMBED_COLOR_ERROR},
+}
+ 
+# --- "What gets wiped" rules -----------------------------------------------------
+# Each rule is (columns, value):
+#   "F"    -> that single column
+#   "R:AN" -> every column from R to AN (inclusive)
+# The value is written ONLY to the user's own row, only in those columns.
+# Use "" to empty a cell, 0 for zero, False to untick a checkbox.
+ 
+# Company sheets: just empty the username cell.
+COMPANY_WIPE_RULES = [
+    (SHEET_USERNAME_COL, ""),
+]
+ 
+# School sheet: empty the username + untick the 3 checkboxes (J, K, L).
+SCHOOL_WIPE_RULES = [
+    (SHEET_USERNAME_COL, ""),
+    ("J:L", False),
+]
+ 
+# Data sheet: reset the row to a "blank cadet".
+# NOTE: H (total points) is a formula and if you touch it I will touch you.
+DATA_WIPE_RULES = [
+    ("D", ""), # username
+    ("F", ""), # designation
+    ("G", ""), # timezone
+    ("I:K", 0), # BE / PD / Hosted points
+    ("E", "Cadet"), # rank
+    ("R:AN", False), # all checkboxes
+]
+ 
+ 
+# ----- HELPERS ---------------------------------------------------------------
+ 
+def col_number(letter):
+    # 'D' -> 4, 'AN' -> 40. Lets the config use normal sheet letters.
+    return a1_to_rowcol(f"{letter}1")[1]
+ 
+ 
+def quoted_range(sheet_title, a1):
+    # Builds "'442nd HORN'!D5". The quotes are needed because the tab names contain spaces.
+    return f"'{sheet_title}'!{a1}"
+ 
+ 
+def sheet_safe_text(text):
+    # Checks all user-typed text in case it starts with a formula symbol.
+    text = str(text)
+    return "'" + text if text[:1] in ("=", "+", "-", "@") else text
+ 
+ 
+def build_rule_updates(sheet_title, row, rules):
+    #Turns a rule list like [("D", ""), ("J:L", False)] into the update entries the batch write expects, for ONE row of ONE sheet.
+    updates = []
+    for cols, value in rules:
+        first, _, last = cols.partition(":")
+        last = last or first # "F" is the same as "F:F"
+        width = col_number(last) - col_number(first) + 1 # how many cells in the span
+        updates.append({
+            "range": quoted_range(sheet_title, f"{first}{row}:{last}{row}"),
+            "values": [[value] * width], # one row, `width` copies of the value
+        })
+    return updates
+ 
+ 
+def find_rows(column_values, username):
+    # Returns the sheet row numbers (1-indexed) whose username cell matches `username` (case-insensitive, exact match). column_values is the list
+    # the API returns for a single column: one [cell] list per row. More than one row can match; all of them are cleaned.
+    target = username.strip().lower()
+    return [
+        i + 1
+        for i, row in enumerate(column_values)
+        if get_cell(row, 0).strip().lower() == target
+    ]
+ 
+ 
+def first_free_row(column_values, start_row):
+    # First row (1-indexed, >= start_row) with an empty username cell. If every fetched row is full, that's the row right after the last one.
+    for row_number in range(start_row, len(column_values) + 1):
+        if not get_cell(column_values[row_number - 1], 0).strip():
+            return row_number
+    return max(start_row, len(column_values) + 1)
+ 
+ 
+# ----- SHEET I/O -----------------------------------------------------------------
+# Both functions are blocking (gspread), so the command runs them through
+# asyncio.to_thread, exactly like get_sheet_data()/update_cells() do.
+ 
+def fetch_discharge_data(company_sheet_name):
+    """ONE request that reads everything the command needs:
+      - Data sheet, columns A..F up to the last player row (A..F, not just
+        D, so the existing COL_* constants and build_username_index() keep
+        working unchanged — it must reach at least COL_DESIGNATION).
+      - the username column of the DISCHARGE, company and SCHOOL sheets
+        (only that column: we just need to find rows, not read whole tabs).
+    Returns the four results in a fixed order."""
+    username_col = f"{SHEET_USERNAME_COL}:{SHEET_USERNAME_COL}"
+    response = sh.values_batch_get([
+        quoted_range(sheet.title, f"A1:F{DATA_END_ROW}"),
+        quoted_range(DISCHARGE_SHEET_NAME, username_col),
+        quoted_range(company_sheet_name, username_col),
+        quoted_range(DISCHARGE_SCHOOL_SHEET_NAME, username_col),
+    ])
+    # An entirely empty range comes back without a "values" key -> default to [].
+    data_rows, discharge_col, company_col, school_col = (
+        value_range.get("values", []) for value_range in response["valueRanges"]
+    )
+    return data_rows, discharge_col, company_col, school_col
+ 
+ 
+def write_discharge_updates(updates):
+    """ONE request that applies every change to every sheet at once."""
+    sh.values_batch_update({"valueInputOption": "USER_ENTERED", "data": updates})
+ 
+ 
+# ----- COMMAND ---------------------------------------------------------------
+ 
+@bot.tree.command(name="discharge", description="Discharge a member: file it and remove them from every sheet.")
+@app_commands.describe(
+    username="The Roblox username of the member to discharge.",
+    company="The company the member belongs to.",
+    discharge_type="The type of discharge.",
+    reason="The reason for the discharge (can be a short phrase).",
+)
+@app_commands.rename(discharge_type="type")   # shows as "type" in Discord, avoids shadowing Python's type()
+@app_commands.choices(
+    # The dropdowns are generated from the config above.
+    company=[app_commands.Choice(name=info["label"], value=key) for key, info in DISCHARGE_COMPANIES.items()],
+    discharge_type=[app_commands.Choice(name=key, value=key) for key in DISCHARGE_TYPES],
+)
+@require_role()   # same high-rank role list as /promote, /addpoints, etc. (CMD_PERMS_ROLES)
+async def discharge(
+    interaction: discord.Interaction,
+    username: str,
+    company: app_commands.Choice[str],
+    discharge_type: app_commands.Choice[str],
+    reason: app_commands.Range[str, 1, DISCHARGE_REASON_MAX],
+):
+    # 1) VALIDATE before touching the network or the lock.
+    username = username.strip()
+    reason = reason.strip()
+    if not username or not reason:
+        await interaction.response.send_message(
+            embed=make_error_embed("Invalid Input", "The username and the reason can't be empty."),
+            ephemeral=True,
+        )
+        return
+ 
+    # 2) BUSY CHECK: this command writes, so only one at a time.
+    if command_lock.locked():
+        await interaction.response.send_message(embed=make_busy_embed(), ephemeral=True)
+        return
+ 
+    company_cfg = DISCHARGE_COMPANIES[company.value]
+    type_cfg = DISCHARGE_TYPES[discharge_type.value]
+ 
+    # 3) WORK
+    async with command_lock:
+        await interaction.response.defer()
+        try:
+            # --- 3a) One batched read for all four sheets.
+            data_rows, discharge_col, company_col, school_col = await asyncio.to_thread(
+                fetch_discharge_data, company_cfg["sheet"]
+            )
+ 
+            # --- 3b) Find the user in the Data sheet. We refuse to continue
+            #         if they aren't there: we need their designation, and
+            #         it also protects against typos filing a bogus discharge.
+            username_index = build_username_index(data_rows)
+            data_idx = username_index.get(username.lower())
+            if data_idx is None:
+                await interaction.followup.send(
+                    embed=make_error_embed(
+                        "Record Not Found",
+                        f"No record found for **{username}** in the Data sheet. Nothing was changed.",
+                    )
+                )
+                return
+ 
+            data_row = data_rows[data_idx]
+            display_name = get_cell(data_row, COL_USERNAME, username)    # exact casing from the sheet
+            designation = get_cell(data_row, COL_DESIGNATION, "N/A")
+            previous_rank = get_cell(data_row, COL_RANK, "N/A")
+            data_row_number = data_idx + 1                               # 0-based -> 1-based sheet row
+ 
+            # --- 3c) Build EVERY change into one list. Nothing is sent yet.
+            updates = []
+ 
+            # Discharge log: first free row in the DISCHARGE sheet.
+            log_row = first_free_row(discharge_col, DISCHARGE_FIRST_DATA_ROW)
+            log_values = {
+                "designation": designation,
+                "username":    display_name,
+                "date":        datetime.now().strftime(DISCHARGE_DATE_FORMAT),
+                "type":        discharge_type.value,
+                "reason":      reason,
+                "signature":   interaction.user.display_name,   # server nickname, e.g. CS-6141 "Luke"
+            }
+            for key, column in DISCHARGE_LOG_COLUMNS.items():
+                value = sheet_safe_text(log_values[key]) if key in ("reason", "signature", "designation") else log_values[key]
+                updates.append({
+                    "range": quoted_range(DISCHARGE_SHEET_NAME, f"{column}{log_row}"),
+                    "values": [[value]],
+                })
+ 
+            # Company sheet: clean every row that matches (normally just one).
+            company_rows = find_rows(company_col, display_name)
+            for row_number in company_rows:
+                updates += build_rule_updates(company_cfg["sheet"], row_number, COMPANY_WIPE_RULES)
+ 
+            # School sheet: same idea, plus the 3 checkboxes (see SCHOOL_WIPE_RULES).
+            school_rows = find_rows(school_col, display_name)
+            for row_number in school_rows:
+                updates += build_rule_updates(DISCHARGE_SCHOOL_SHEET_NAME, row_number, SCHOOL_WIPE_RULES)
+ 
+            # Data sheet: reset the user's row.
+            updates += build_rule_updates(sheet.title, data_row_number, DATA_WIPE_RULES)
+ 
+            # --- 3d) One batched write for everything.
+            await asyncio.to_thread(write_discharge_updates, updates)
+ 
+            # --- 3e) Re-sort the Data sheet (same Apps Script /promote uses).
+            #         A sorting failure doesn't undo the discharge, so we only warn.
+            sort_ok = True
+            try:
+                await asyncio.to_thread(sort_users)
+            except Exception as e:
+                sort_ok = False
+                print(f"WARNING: Discharge succeeded but sorting failed: {e}")
+ 
+            # --- 3f) Success embed.
+            removed_lines = [
+                "✅ Data sheet (row reset to Cadet)",
+                f"✅ {company_cfg['sheet']}" if company_rows else f"➖ {company_cfg['sheet']} (not found there)",
+                f"✅ {DISCHARGE_SCHOOL_SHEET_NAME} (checkboxes reset)" if school_rows else f"➖ {DISCHARGE_SCHOOL_SHEET_NAME} (not found there)",
+            ]
+            fields = [
+                ("Username", display_name, True),
+                ("Designation", designation, True),
+                ("Previous Rank", previous_rank, True),
+                ("Company", company_cfg["label"], True),
+                ("Type", f"{type_cfg['emoji']} {discharge_type.value}", True),
+                ("Filed In", f"{DISCHARGE_SHEET_NAME} (row {log_row})", True),
+                ("Reason", reason, False),
+                ("Removed From", "\n".join(removed_lines), False),
+            ]
+            if not sort_ok:
+                fields.append(("⚠️ Sorting Failed", "The discharge went through, but the Data sheet could not be re-sorted. Please sort it manually.", False))
+ 
+            embed = make_embed(
+                interaction,
+                title=f"{type_cfg['emoji']} Discharge Filed | {display_name}",
+                color=type_cfg["color"],
+                fields=fields,
+                verb="Updated",
+            )
+            await interaction.followup.send(embed=embed)
+            print(f"Discharged {display_name} ({discharge_type.value}) by {interaction.user}.")
+ 
+        except APIError as e:
+            # Most common cause: a tab name in the config doesn't match the real one.
+            print(f"Google Sheets API error in discharge: {e}")
+            await interaction.followup.send(
+                embed=make_error_embed(
+                    "Sheets Error",
+                    "Google rejected the request. Check that every sheet name in the discharge "
+                    "config matches the real tab name exactly. Nothing was changed.",
+                )
+            )
+        except Exception as e:
+            print(f"Error in discharge: {e}")
+            await interaction.followup.send(
+                embed=make_error_embed("Something Went Wrong", "An error occurred while processing the command.")
+            )
+
+# ============================================================
+# /rank  — set a member's rank directly in the Data sheet
+# ============================================================
+
+# Embed colors for the two outcomes (reuses the global palette).
+RANK_COLOR_CHANGED   = EMBED_COLOR_SUCCESS
+RANK_COLOR_UNCHANGED = EMBED_COLOR_GOLD
+
+# ----- HELPER ---------------------
+def fetch_rank_columns():
+    """Reads Data!A1:E<last row> — just enough columns to reach the rank
+    cell. rowcol_to_a1(DATA_END_ROW, COL_RANK + 1) -> e.g. 'E978'
+    (COL_RANK is 0-indexed, a sheet column is 1-indexed, hence the +1)."""
+    last_cell = rowcol_to_a1(DATA_END_ROW, COL_RANK + 1)
+    return sheet.get(f"A1:{last_cell}")
+
+@bot.tree.command(name="rank", description="Set a member's rank in the Data sheet.")
+@app_commands.describe(
+    username="The Roblox username of the member.",
+    rank="The rank to give them.",
+)
+@app_commands.choices(
+    # Dropdown built from the global `ranks` list (Cadet -> Battalion Commander).
+    rank=[app_commands.Choice(name=r, value=r) for r in ranks]
+)
+@require_role()   # CMD_PERMS_ROLES only
+async def rank_command(interaction: discord.Interaction, username: str, rank: app_commands.Choice[str]):
+    # 1) VALIDATE before touching the network or the lock.
+    username = username.strip()
+    if not username:
+        await interaction.response.send_message(
+            embed=make_error_embed("Invalid Username", "You must provide a Roblox username."), ephemeral=True
+        )
+        return
+ 
+    # 2) BUSY CHECK: this command writes, so only one at a time.
+    if command_lock.locked():
+        await interaction.response.send_message(embed=make_busy_embed(), ephemeral=True)
+        return
+ 
+    # 3) WORK
+    async with command_lock:
+        await interaction.response.defer()
+        try:
+            # --- 3a) Read + locate the user (O(1) lookup via the shared index helper).
+            list_of_lists = await asyncio.to_thread(fetch_rank_columns)
+            username_index = build_username_index(list_of_lists)
+            row_idx = username_index.get(username.lower())
+ 
+            if row_idx is None:
+                await interaction.followup.send(
+                    embed=make_error_embed(
+                        "Record Not Found", f"No record found for **{username}** in the battalion sheet."
+                    )
+                )
+                return
+ 
+            row = list_of_lists[row_idx]
+            display_name = get_cell(row, COL_USERNAME, username)   # exact casing from the sheet
+            old_rank = get_cell(row, COL_RANK, "N/A")
+            designation = get_cell(row, COL_DESIGNATION, "N/A")
+            new_rank = rank.value
+            
+ 
+            # --- 3b) Same rank already? Nothing to write, nothing to sort.
+            if old_rank == new_rank:
+                await interaction.followup.send(
+                    embed=make_embed(
+                        interaction,
+                        title=f"Rank Unchanged | {display_name}",
+                        description=f"**{display_name}** is already **{new_rank}**. Nothing was changed.",
+                        color=RANK_COLOR_UNCHANGED,
+                        verb="Requested",
+                    )
+                )
+                return
+ 
+            # --- 3c) Write the single rank cell (row_idx is 0-based, Cell wants 1-based).
+            cell_list.append(Cell(row=row_idx + 1, col=COL_RANK + 1, value=new_rank))
+            await update_cells(cell_list)
+ 
+            # --- 3d) Re-sort. A sorting failure doesn't undo the rank change, so only warn.
+            sort_ok = True
+            try:
+                await asyncio.to_thread(sort_users)
+            except Exception as e:
+                sort_ok = False
+                print(f"WARNING: Rank change succeeded but sorting failed: {e}")
+ 
+            # --- 3e) Success embed.
+            fields = [
+                ("Username", display_name, True),
+                ("Designation", designation, True),
+                ("Rank Change", f"{old_rank} → **{new_rank}**", False),
+            ]
+            if not sort_ok:
+                fields.append(("⚠️ Sorting Failed", "The rank was changed, but the Data sheet could not be re-sorted. Please sort it manually.", False))
+ 
+            await interaction.followup.send(
+                embed=make_embed(
+                    interaction,
+                    title=f"Rank Updated | {display_name}",
+                    color=RANK_COLOR_CHANGED,
+                    fields=fields,
+                    verb="Updated",
+                )
+            )
+            print(f"Rank of {display_name} changed: {old_rank} -> {new_rank}.")
+ 
+        except Exception as e:
+            print(f"Error in rank: {e}")
+            await interaction.followup.send(
+                embed=make_error_embed("Something Went Wrong", "An error occurred while processing the command.")
+            )
 
 
 bot.run(DISCORD_BOT_TOKEN)
