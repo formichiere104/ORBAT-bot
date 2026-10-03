@@ -2743,18 +2743,18 @@ def parse_request_message(text, cfg):
     """
     fields = cfg["fields"]
     by_label = {_normalize_label(f["label"]): f for f in fields}
-    text = re.sub(r"```[a-zA-Z]*", "", text)  # drop code-fence markers if the format was pasted as a block
+    text = re.sub(r"```[a-zA-Z]*", "", text) # drop code-fence markers if the format was pasted as a block
  
-    chunks = {f["key"]: [] for f in fields}   # raw lines collected per field
+    chunks = {f["key"]: [] for f in fields} # raw lines collected per field
     seen, duplicates = set(), []
-    current = None   # None = no field started yet | False = inside a duplicated field (ignored) | str = active field key
+    current = None # None = no field started yet | False = inside a duplicated field (ignored) | str = active field key
     stray_text = False
  
     for line in text.replace("\r", "").split("\n"):
         head, sep, rest = line.partition(":")
         field = by_label.get(_normalize_label(head)) if sep else None
  
-        if field:                                    # a 'Label:' line
+        if field: # a 'Label:' line
             if field["key"] in seen:
                 if field["label"] not in duplicates:
                     duplicates.append(field["label"])
@@ -2763,15 +2763,15 @@ def parse_request_message(text, cfg):
             seen.add(field["key"])
             current = field["key"]
             chunks[current].append(rest)
-        elif current is None:                        # text before any field
+        elif current is None: # text before any field
             if line.strip():
                 stray_text = True
-        elif current:                                # continuation of the current field
+        elif current: # continuation of the current field
             chunks[current].append(line)
  
     errors, missing, empty, values = [], [], [], {}
     if stray_text:
-        errors.append("There is text **before** the first field — put everything inside the format.")
+        errors.append("There is text **before** the first field, put everything inside the format.")
     if duplicates:
         errors.append("These fields appear more than once: " + ", ".join(f"**{d}**" for d in duplicates) + ".")
  
@@ -2788,19 +2788,17 @@ def parse_request_message(text, cfg):
             values[field["key"]] = value
  
     if missing:
-        errors.append("Missing field(s): " + ", ".join(f"**{m}**" for m in missing) + " — keep the labels exactly as in the format.")
+        errors.append("Missing field(s): " + ", ".join(f"**{m}**" for m in missing) + ", keep the labels exactly as in the format.")
     if empty:
         errors.append("These fields are empty: " + ", ".join(f"**{e}**" for e in empty) + ".")
  
     return (None if errors else values), errors
  
  
-# ----- E. The DM session (behind the panel buttons) -----------------------------
+# ----- DM -----------------------------
  
 async def collect_request_form(user, dm_channel, kind):
-    """Waits (up to the session timeout, measured from when the format was
-    sent — NOT reset by each attempt) for a valid reply. Returns the parsed
-    values, or None if the user cancelled / it expired."""
+    # Waits for the format submitted by the user
     cfg = REQUEST_TYPES[kind]
     loop = asyncio.get_running_loop()
     deadline = loop.time() + REQUEST_SESSION_TIMEOUT_SECONDS
@@ -2822,7 +2820,7 @@ async def collect_request_form(user, dm_channel, kind):
             await dm_channel.send(embed=make_error_embed("Request Cancelled", "No request was submitted."))
             return None
  
-        if not content:  # e.g. they sent only an image/file
+        if not content: # if they sent only an image/file
             errors = ["I didn't receive any text. Please send the format as a normal text message."]
             values = None
         else:
@@ -2831,7 +2829,7 @@ async def collect_request_form(user, dm_channel, kind):
         if values is not None:
             return values
         await dm_channel.send(embed=build_format_embed(kind, user.name, errors=errors))
-        # ...and loop: wait for their corrected message.
+        # Loop: wait for their corrected message
  
  
 async def start_request_session(interaction, kind):
@@ -2839,7 +2837,7 @@ async def start_request_session(interaction, kind):
     cfg = REQUEST_TYPES[kind]
     user = interaction.user
  
-    # 1) Only one open form per person (two would fight over the same DM replies).
+    # Only one open form per person
     if user.id in active_request_sessions:
         await interaction.response.send_message(
             embed=make_error_embed(
@@ -2850,7 +2848,7 @@ async def start_request_session(interaction, kind):
         )
         return
  
-    # 2) Fail early (before the user wastes time on a form) if the destination is broken.
+    # Fail early if the destination is broken
     if get_request_channel(kind) is None:
         await interaction.response.send_message(
             embed=make_error_embed(
@@ -2860,10 +2858,11 @@ async def start_request_session(interaction, kind):
             ephemeral=True,
         )
         return
- 
-    active_request_sessions.add(user.id)  # no await since the check above -> can't be double-clicked past
+
+    # no await since the check above -> can't be double-clicked past
+    active_request_sessions.add(user.id)
     try:
-        # 3) Acknowledge inside Discord's 3-second window, then DM the format.
+        # Acknowledge inside discord's 3 second window, then DM the format
         await interaction.response.defer(ephemeral=True)
         try:
             dm_message = await user.send(embed=build_format_embed(kind, user.name))
@@ -2882,36 +2881,34 @@ async def start_request_session(interaction, kind):
             )
             return
  
-        await interaction.followup.send(f"📬 Check your DMs — I sent you the **{cfg['short_name']}** format.", ephemeral=True)
+        await interaction.followup.send(f"📬 Check your DMs, I sent you the **{cfg['short_name']}** format.", ephemeral=True)
  
-        # 4) Snapshot everything we need from the member NOW (their roles come
-        #    straight from the click, so no extra API call is needed later).
+        # Get everything we need from the member
         company, hq_role_id = resolve_company(user)
         submitter = {
             "id": user.id,
-            "username": user.name,                # e.g. "whov2"
-            "display_name": user.display_name,    # server nickname, e.g. CT-5026 "Rhombus"
+            "username": user.name, # discord username
+            "display_name": user.display_name, # server nickname, e.g. CT-5026 "Rhombus"
             "icon": user.display_avatar.url,
         }
  
-        # 5) Wait for a valid form, then submit it.
+        # Wait for a valid form, then submit it
         values = await collect_request_form(user, dm_message.channel, kind)
         if values is not None:
             await submit_request(dm_message.channel, kind, values, submitter, company, hq_role_id, user.guild.id)
     except Exception as e:
         print(f"Error in request session for {user}: {e}")
     finally:
-        active_request_sessions.discard(user.id)  # always free the slot, whatever happened
+        active_request_sessions.discard(user.id) # always free the slot
  
  
-# ----- F. Posting a validated request ---------------------------------------------
+# ----- Posting the request ---------------------------------------------
  
 async def submit_request(dm_channel, kind, values, submitter, company, hq_role_id, guild_id):
-    """Creates the record + ID, posts it (pinging HQ if configured), logs it,
-    and tells the submitter."""
+    # Creates the record + ID, posts it, logs it, and tells the submitter
     cfg = REQUEST_TYPES[kind]
     channel = get_request_channel(kind)
-    if channel is None:  # became unavailable while they were filling the form
+    if channel is None: # became unavailable while they were filling the form
         await dm_channel.send(embed=make_error_embed(
             "Couldn't Submit", "The requests channel is unavailable right now. Please tell a member of command."
         ))
@@ -2941,7 +2938,7 @@ async def submit_request(dm_channel, kind, values, submitter, company, hq_role_i
     }
     request_log[request_id] = record
  
-    # Only pings the HQ role (nothing else) when this type wants it AND the company was identified.
+    # Only pings the HQ role when this type wants it and the company was identified
     ping_content, allowed = None, discord.AllowedMentions.none()
     if cfg["ping_hq"] and hq_role_id:
         ping_content = f"<@&{hq_role_id}>"
@@ -2952,7 +2949,8 @@ async def submit_request(dm_channel, kind, values, submitter, company, hq_role_i
             content=ping_content, embed=build_request_embed(record), view=RequestReviewView(), allowed_mentions=allowed
         )
     except discord.HTTPException as e:
-        request_log.pop(request_id, None)  # nothing was posted -> undo, keep the log and numbering clean
+        # nothing was posted -> undo, keep the log and numbering clean
+        request_log.pop(request_id, None)
         release_request_id(request_id)
         print(f"Could not post {request_id}: {e}")
         await dm_channel.send(embed=make_error_embed(
@@ -2972,13 +2970,11 @@ async def submit_request(dm_channel, kind, values, submitter, company, hq_role_i
     print(f"Posted {request_id} ({company}).")
  
  
-# ----- G. Accept / Deny -------------------------------------------------------------
+# ----- Accept / Deny -------------------------------------------------------------
  
 async def finalize_review(interaction, record, decision, reason=None):
-    """Applies Accept/Deny: updates the record, edits the message in place
-    (buttons removed), and saves the log."""
-    # The status check and the update below have no `await` between them,
-    # so two reviewers clicking at once can't both succeed.
+    #Applies Accept/Deny: updates the record, edits the message in place (buttons removed), and saves the log
+    # The status check and the update below have no "await" between them so two reviewers clicking at once can't both succeed
     if record["status"] != "pending":
         await interaction.response.send_message(
             embed=make_error_embed("Already Reviewed", "Someone else already handled this request."), ephemeral=True
@@ -2998,7 +2994,7 @@ async def finalize_review(interaction, record, decision, reason=None):
  
  
 class DenyReasonModal(discord.ui.Modal, title="Deny Request"):
-    """Pop-up shown when a reviewer presses Deny — collects the reason."""
+    #Pop-up shown when a reviewer presses Deny
     reason = discord.ui.TextInput(
         label="Denial reason",
         style=discord.TextStyle.paragraph,
@@ -3008,44 +3004,38 @@ class DenyReasonModal(discord.ui.Modal, title="Deny Request"):
     )
  
     async def on_submit(self, interaction: discord.Interaction):
-        # Re-check everything: the modal can sit open for a while.
+        # Re-check everything: the request can sit open for a while
         record = await RequestReviewView.authorize(interaction)
         if record is not None:
             await finalize_review(interaction, record, "denied", reason=self.reason.value.strip())
  
  
 class RequestReviewView(discord.ui.View):
-    """Persistent Accept / Deny buttons on every posted request. Registered
-    once in setup_hook, so they keep working after a restart. The request is
-    found from the message the button sits on — nothing is stored in the custom_id."""
+    # Manages the persistence of accept/deny buttons
  
     def __init__(self):
         super().__init__(timeout=None)
  
     @staticmethod
     async def authorize(interaction):
-        """Shared gate for both buttons and the modal. Returns the request's
-        record if the clicker may review it, otherwise replies with the
-        reason (privately) and returns None."""
+        # Buttons manager
         if not member_has_any_role(interaction.user, REQUEST_REVIEWER_ROLE_IDS):
             await interaction.response.send_message(
                 embed=make_error_embed("Permission Denied", "Only HQ can accept or deny requests."), ephemeral=True
             )
             return None
-        # interaction.message is the message the button/modal was attached
-        # to; discord.py carries it through from the button click into the
-        # deny-reason modal's on_submit too. Guarded here just in case a
-        # future discord.py version ever stops attaching it.
+        # interaction.message is the message the button/modal was attached to; discord.py carries it through from the button click into the
+        # deny-reason modal's on_submit too. Guarded here just in case a future discord.py version ever stops attaching it.
         if interaction.message is None:
             await interaction.response.send_message(
-                embed=make_error_embed("Something Went Wrong", "Couldn't tell which request this was for — please try again."),
+                embed=make_error_embed("Something Went Wrong", "I've got no clue which request this was for, please try again."),
                 ephemeral=True,
             )
             return None
         record = request_log.get(request_message_index.get(interaction.message.id))
         if record is None:
             await interaction.response.send_message(
-                embed=make_error_embed("Request Not Found", "This request isn't in the log (was the log file deleted?)."),
+                embed=make_error_embed("Request Not Found", "This request isn't in the log (was the log file deleted by some unfortunate actions?)."),
                 ephemeral=True,
             )
             return None
@@ -3069,12 +3059,10 @@ class RequestReviewView(discord.ui.View):
             await interaction.response.send_modal(DenyReasonModal())
  
  
-# ----- H. Panel view + /requestpanel ----------------------------------------------------
+# ----- Panel view + /requestpanel ----------------------------------------------------
  
 class RequestPanelView(discord.ui.View):
-    """The buttons under the panel. They are generated from REQUEST_TYPES,
-    so adding a new request type there adds its button automatically.
-    Persistent (registered in setup_hook): survives restarts."""
+    # Request panel buttons (survive bot restarts)
  
     def __init__(self):
         super().__init__(timeout=None)
@@ -3101,7 +3089,7 @@ class RequestPanelView(discord.ui.View):
 async def requestpanel(interaction: discord.Interaction, channel: Optional[discord.TextChannel] = None):
     target = channel or interaction.channel
  
-    # Check the bot can actually post there BEFORE trying.
+    # Check the bot can actually post there
     perms = target.permissions_for(interaction.guild.me)
     if not (perms.view_channel and perms.send_messages and perms.embed_links):
         await interaction.response.send_message(
@@ -3132,30 +3120,30 @@ async def requestpanel(interaction: discord.Interaction, channel: Optional[disco
 
 # ----- CONFIG ---------------------------------------------------------------
 
-# Sheet names. They must match the tab names EXACTLY.
+# Sheet names. They must match the tab names EXACTLY
 DISCHARGE_SHEET_NAME = "442nd DISCHARGE"
 DISCHARGE_SCHOOL_SHEET_NAME = "442nd SCHOOL"
  
-# Every sheet we search stores the roblox username in this column.
+# Every sheet we search stores the roblox username in this column
 SHEET_USERNAME_COL = "D"
  
-# First row of the DISCHARGE sheet that can hold an entry.
+# First row of the DISCHARGE sheet that can hold an entry
 DISCHARGE_FIRST_DATA_ROW = 10
  
-# Which column of the DISCHARGE sheet receives which value.
-# (Add / move columns here; the code writes each one individually.)
+# Columns of the DISCHARGE sheet
 DISCHARGE_LOG_COLUMNS = {
-    "designation": "C",   # CT number + nickname, taken from the Data sheet
+    "designation": "C", # CT number + nickname, taken from the Data sheet
     "username":    "D",
-    "date":        "E",   # date of the discharge
-    "type":        "F",   # Honorable / Dishonorable / PURGED
+    "date":        "E",
+    "type":        "F", # Honorable / Dishonorable / PURGED
     "reason":      "G",
-    "signature":   "H",   # server nickname of whoever ran the command
+    "signature":   "H", # server nickname of whoever ran the command
 }
-DISCHARGE_DATE_FORMAT = "%d/%m/%Y"   # DD/MM/YYYY
-DISCHARGE_REASON_MAX = 500           # max characters accepted for the reason
+DISCHARGE_DATE_FORMAT = "%d/%m/%Y"
+# Max chars per discharge reason
+DISCHARGE_REASON_MAX = 500
  
-# Dropdown 1: companies. key -> label shown in Discord + the sheet to clean.
+# The next two lists are for the 2 dropdown menus
 # To add a company: add one line here, nothing else needs to change.
 DISCHARGE_COMPANIES = {
     "horn":      {"label": "Horn",      "sheet": "442nd HORN"},
@@ -3164,19 +3152,17 @@ DISCHARGE_COMPANIES = {
     "viper":     {"label": "Viper",     "sheet": "442nd VIPER"},
     "hq":        {"label": "Havoc/HQ",  "sheet": "442nd HQ"},   # the HQ sheet also holds the Havoc members
 }
- 
-# Dropdown 2: discharge types. The KEY is the exact text written in the sheet.
+
 DISCHARGE_TYPES = {
     "Honorable":    {"emoji": "🟢", "color": EMBED_COLOR_SUCCESS},
     "Dishonorable": {"emoji": "🟠", "color": EMBED_COLOR_GOLD},
     "PURGED":       {"emoji": "🔴", "color": EMBED_COLOR_ERROR},
 }
  
-# --- "What gets wiped" rules -----------------------------------------------------
+# -----  "wiping" rules ---------------------------------------------------------------
 # Each rule is (columns, value):
 #   "F"    -> that single column
 #   "R:AN" -> every column from R to AN (inclusive)
-# The value is written ONLY to the user's own row, only in those columns.
 # Use "" to empty a cell, 0 for zero, False to untick a checkbox.
  
 # Company sheets: just empty the username cell.
@@ -3190,7 +3176,6 @@ SCHOOL_WIPE_RULES = [
     ("J:L", False),
 ]
  
-# Data sheet: reset the row to a "blank cadet".
 # NOTE: H (total points) is a formula and if you touch it I will touch you.
 DATA_WIPE_RULES = [
     ("D", ""), # username
@@ -3210,18 +3195,18 @@ def col_number(letter):
  
  
 def quoted_range(sheet_title, a1):
-    # Builds "'442nd HORN'!D5". The quotes are needed because the tab names contain spaces.
+    # Builds "'442nd HORN'!D5"
     return f"'{sheet_title}'!{a1}"
  
  
 def sheet_safe_text(text):
-    # Checks all user-typed text in case it starts with a formula symbol.
+    # Avoiding user-entered formulas
     text = str(text)
     return "'" + text if text[:1] in ("=", "+", "-", "@") else text
  
  
 def build_rule_updates(sheet_title, row, rules):
-    #Turns a rule list like [("D", ""), ("J:L", False)] into the update entries the batch write expects, for ONE row of ONE sheet.
+    #Turns a rule list like [("D", ""), ("J:L", False)] into the update entries the batch write expects, for ONE row of ONE sheet
     updates = []
     for cols, value in rules:
         first, _, last = cols.partition(":")
@@ -3235,8 +3220,7 @@ def build_rule_updates(sheet_title, row, rules):
  
  
 def find_rows(column_values, username):
-    # Returns the sheet row numbers (1-indexed) whose username cell matches `username` (case-insensitive, exact match). column_values is the list
-    # the API returns for a single column: one [cell] list per row. More than one row can match; all of them are cleaned.
+    # Returns the sheet row numbers (1-indexed) whose username cell matches `username` (case-insensitive)
     target = username.strip().lower()
     return [
         i + 1
@@ -3246,7 +3230,7 @@ def find_rows(column_values, username):
  
  
 def first_free_row(column_values, start_row):
-    # First row (1-indexed, >= start_row) with an empty username cell. If every fetched row is full, that's the row right after the last one.
+    # First row (1-indexed, >= start_row) with an empty username cell
     for row_number in range(start_row, len(column_values) + 1):
         if not get_cell(column_values[row_number - 1], 0).strip():
             return row_number
@@ -3254,17 +3238,9 @@ def first_free_row(column_values, start_row):
  
  
 # ----- SHEET I/O -----------------------------------------------------------------
-# Both functions are blocking (gspread), so the command runs them through
-# asyncio.to_thread, exactly like get_sheet_data()/update_cells() do.
  
 def fetch_discharge_data(company_sheet_name):
-    """ONE request that reads everything the command needs:
-      - Data sheet, columns A..F up to the last player row (A..F, not just
-        D, so the existing COL_* constants and build_username_index() keep
-        working unchanged — it must reach at least COL_DESIGNATION).
-      - the username column of the DISCHARGE, company and SCHOOL sheets
-        (only that column: we just need to find rows, not read whole tabs).
-    Returns the four results in a fixed order."""
+    # One request that reads the needed column/s of discharge, company, and data sheets
     username_col = f"{SHEET_USERNAME_COL}:{SHEET_USERNAME_COL}"
     response = sh.values_batch_get([
         quoted_range(sheet.title, f"A1:F{DATA_END_ROW}"),
@@ -3272,7 +3248,7 @@ def fetch_discharge_data(company_sheet_name):
         quoted_range(company_sheet_name, username_col),
         quoted_range(DISCHARGE_SCHOOL_SHEET_NAME, username_col),
     ])
-    # An entirely empty range comes back without a "values" key -> default to [].
+    # An entirely empty range comes back without a "values" key -> default to []
     data_rows, discharge_col, company_col, school_col = (
         value_range.get("values", []) for value_range in response["valueRanges"]
     )
@@ -3280,26 +3256,26 @@ def fetch_discharge_data(company_sheet_name):
  
  
 def write_discharge_updates(updates):
-    """ONE request that applies every change to every sheet at once."""
+    # The single batch-write for all changes
     sh.values_batch_update({"valueInputOption": "USER_ENTERED", "data": updates})
  
  
 # ----- COMMAND ---------------------------------------------------------------
  
-@bot.tree.command(name="discharge", description="Discharge a member: file it and remove them from every sheet.")
+@bot.tree.command(name="discharge", description="Discharge a member and remove them from every sheet.")
 @app_commands.describe(
     username="The Roblox username of the member to discharge.",
     company="The company the member belongs to.",
     discharge_type="The type of discharge.",
-    reason="The reason for the discharge (can be a short phrase).",
+    reason="The reason for the discharge.",
 )
-@app_commands.rename(discharge_type="type")   # shows as "type" in Discord, avoids shadowing Python's type()
+@app_commands.rename(discharge_type="type")
 @app_commands.choices(
-    # The dropdowns are generated from the config above.
+    # Dropdown menus (company and discharge type)
     company=[app_commands.Choice(name=info["label"], value=key) for key, info in DISCHARGE_COMPANIES.items()],
     discharge_type=[app_commands.Choice(name=key, value=key) for key in DISCHARGE_TYPES],
 )
-@require_role()   # same high-rank role list as /promote, /addpoints, etc. (CMD_PERMS_ROLES)
+@require_role()
 async def discharge(
     interaction: discord.Interaction,
     username: str,
@@ -3307,7 +3283,7 @@ async def discharge(
     discharge_type: app_commands.Choice[str],
     reason: app_commands.Range[str, 1, DISCHARGE_REASON_MAX],
 ):
-    # 1) VALIDATE before touching the network or the lock.
+    # Initial checks
     username = username.strip()
     reason = reason.strip()
     if not username or not reason:
@@ -3317,7 +3293,7 @@ async def discharge(
         )
         return
  
-    # 2) BUSY CHECK: this command writes, so only one at a time.
+    # Busy check
     if command_lock.locked():
         await interaction.response.send_message(embed=make_busy_embed(), ephemeral=True)
         return
@@ -3325,18 +3301,16 @@ async def discharge(
     company_cfg = DISCHARGE_COMPANIES[company.value]
     type_cfg = DISCHARGE_TYPES[discharge_type.value]
  
-    # 3) WORK
+    # Logic logic logic
     async with command_lock:
         await interaction.response.defer()
         try:
-            # --- 3a) One batched read for all four sheets.
+            # One batch-read for all 4 sheets
             data_rows, discharge_col, company_col, school_col = await asyncio.to_thread(
                 fetch_discharge_data, company_cfg["sheet"]
             )
  
-            # --- 3b) Find the user in the Data sheet. We refuse to continue
-            #         if they aren't there: we need their designation, and
-            #         it also protects against typos filing a bogus discharge.
+            # Find user in Data sheet
             username_index = build_username_index(data_rows)
             data_idx = username_index.get(username.lower())
             if data_idx is None:
@@ -3349,15 +3323,15 @@ async def discharge(
                 return
  
             data_row = data_rows[data_idx]
-            display_name = get_cell(data_row, COL_USERNAME, username)    # exact casing from the sheet
+            display_name = get_cell(data_row, COL_USERNAME, username)
             designation = get_cell(data_row, COL_DESIGNATION, "N/A")
             previous_rank = get_cell(data_row, COL_RANK, "N/A")
-            data_row_number = data_idx + 1                               # 0-based -> 1-based sheet row
+            data_row_number = data_idx + 1
  
-            # --- 3c) Build EVERY change into one list. Nothing is sent yet.
+            # Compile every change into a single list
             updates = []
  
-            # Discharge log: first free row in the DISCHARGE sheet.
+            # 442nd DISCHARGE sheet
             log_row = first_free_row(discharge_col, DISCHARGE_FIRST_DATA_ROW)
             log_values = {
                 "designation": designation,
@@ -3365,7 +3339,8 @@ async def discharge(
                 "date":        datetime.now().strftime(DISCHARGE_DATE_FORMAT),
                 "type":        discharge_type.value,
                 "reason":      reason,
-                "signature":   interaction.user.display_name,   # server nickname, e.g. CS-6141 "Luke"
+                # server nickname, e.g. CT-4358 "Luke"
+                "signature":   interaction.user.display_name,
             }
             for key, column in DISCHARGE_LOG_COLUMNS.items():
                 value = sheet_safe_text(log_values[key]) if key in ("reason", "signature", "designation") else log_values[key]
@@ -3374,24 +3349,23 @@ async def discharge(
                     "values": [[value]],
                 })
  
-            # Company sheet: clean every row that matches (normally just one).
+            # Clear username from company sheet
             company_rows = find_rows(company_col, display_name)
             for row_number in company_rows:
                 updates += build_rule_updates(company_cfg["sheet"], row_number, COMPANY_WIPE_RULES)
  
-            # School sheet: same idea, plus the 3 checkboxes (see SCHOOL_WIPE_RULES).
+            # Clear username and reset checkboxes in school sheet
             school_rows = find_rows(school_col, display_name)
             for row_number in school_rows:
                 updates += build_rule_updates(DISCHARGE_SCHOOL_SHEET_NAME, row_number, SCHOOL_WIPE_RULES)
  
-            # Data sheet: reset the user's row.
+            # Clear row in Data sheet
             updates += build_rule_updates(sheet.title, data_row_number, DATA_WIPE_RULES)
  
-            # --- 3d) One batched write for everything.
+            # One single batch write for all (to avoid 2000 API calls)
             await asyncio.to_thread(write_discharge_updates, updates)
  
-            # --- 3e) Re-sort the Data sheet (same Apps Script /promote uses).
-            #         A sorting failure doesn't undo the discharge, so we only warn.
+            # Sorting the Data sheet
             sort_ok = True
             try:
                 await asyncio.to_thread(sort_users)
@@ -3399,11 +3373,11 @@ async def discharge(
                 sort_ok = False
                 print(f"WARNING: Discharge succeeded but sorting failed: {e}")
  
-            # --- 3f) Success embed.
+            # Success embed
             removed_lines = [
-                "✅ Data sheet (row reset to Cadet)",
-                f"✅ {company_cfg['sheet']}" if company_rows else f"➖ {company_cfg['sheet']} (not found there)",
-                f"✅ {DISCHARGE_SCHOOL_SHEET_NAME} (checkboxes reset)" if school_rows else f"➖ {DISCHARGE_SCHOOL_SHEET_NAME} (not found there)",
+                "✅ Data sheet",
+                f"✅ {company_cfg['sheet']}" if company_rows else f"➖ {company_cfg['sheet']}",
+                f"✅ {DISCHARGE_SCHOOL_SHEET_NAME}" if school_rows else f"➖ {DISCHARGE_SCHOOL_SHEET_NAME}",
             ]
             fields = [
                 ("Username", display_name, True),
@@ -3416,7 +3390,7 @@ async def discharge(
                 ("Removed From", "\n".join(removed_lines), False),
             ]
             if not sort_ok:
-                fields.append(("⚠️ Sorting Failed", "The discharge went through, but the Data sheet could not be re-sorted. Please sort it manually.", False))
+                fields.append(("Sorting Failed", "The discharge went through, but the Data sheet could not be sorted. Please sort it manually.", False))
  
             embed = make_embed(
                 interaction,
@@ -3429,13 +3403,13 @@ async def discharge(
             print(f"Discharged {display_name} ({discharge_type.value}) by {interaction.user}.")
  
         except APIError as e:
-            # Most common cause: a tab name in the config doesn't match the real one.
+            # Most common cause: the google service account doesn't have access to protected cells, or the name of the sheets isn't configured properly
             print(f"Google Sheets API error in discharge: {e}")
             await interaction.followup.send(
                 embed=make_error_embed(
                     "Sheets Error",
-                    "Google rejected the request. Check that every sheet name in the discharge "
-                    "config matches the real tab name exactly. Nothing was changed.",
+                    "Google rejected the request. Check that the bot has the necessary "
+                    "permissions on the ORBAT. Nothing was changed.",
                 )
             )
         except Exception as e:
@@ -3445,33 +3419,37 @@ async def discharge(
             )
 
 # ============================================================
-# /rank  — set a member's rank directly in the Data sheet
+# /rank  — set a member's rank directly in the Data sheet, bypassing the BE points subtraction of promotions from pvt to lcpl.
+# Obviously use /promote for regular LR promotions.
 # ============================================================
+
+RANK_COMMAND_COLUMNS = (COL_USERNAME, COL_RANK, COL_DESIGNATION)
 
 # Embed colors for the two outcomes (reuses the global palette).
 RANK_COLOR_CHANGED   = EMBED_COLOR_SUCCESS
 RANK_COLOR_UNCHANGED = EMBED_COLOR_GOLD
 
-# ----- HELPER ---------------------
 def fetch_rank_columns():
-    """Reads Data!A1:E<last row> — just enough columns to reach the rank
-    cell. rowcol_to_a1(DATA_END_ROW, COL_RANK + 1) -> e.g. 'E978'
-    (COL_RANK is 0-indexed, a sheet column is 1-indexed, hence the +1)."""
-    last_cell = rowcol_to_a1(DATA_END_ROW, COL_RANK + 1)
+    # Reads from column A up to the right-most column /rank uses
+    # max() picks that column automatically
+    last_col_index = max(RANK_COMMAND_COLUMNS)
+
+    # +1 because the constants are 0-indexed but rowcol_to_a1 is 1-indexed
+    last_cell = rowcol_to_a1(DATA_END_ROW, last_col_index + 1)   # -> "F978"
     return sheet.get(f"A1:{last_cell}")
 
-@bot.tree.command(name="rank", description="Set a member's rank in the Data sheet.")
+@bot.tree.command(name="rank", description="Set a member's rank in the Data sheet. USE /PROMOTE IF THE RANK IS BELOW LCPL!")
 @app_commands.describe(
     username="The Roblox username of the member.",
     rank="The rank to give them.",
 )
 @app_commands.choices(
-    # Dropdown built from the global `ranks` list (Cadet -> Battalion Commander).
+    # Dropdown menu with all ranks in ranks array
     rank=[app_commands.Choice(name=r, value=r) for r in ranks]
 )
-@require_role()   # CMD_PERMS_ROLES only
+@require_role()
 async def rank_command(interaction: discord.Interaction, username: str, rank: app_commands.Choice[str]):
-    # 1) VALIDATE before touching the network or the lock.
+    # Initial check
     username = username.strip()
     if not username:
         await interaction.response.send_message(
@@ -3479,16 +3457,16 @@ async def rank_command(interaction: discord.Interaction, username: str, rank: ap
         )
         return
  
-    # 2) BUSY CHECK: this command writes, so only one at a time.
+    # Busy check
     if command_lock.locked():
         await interaction.response.send_message(embed=make_busy_embed(), ephemeral=True)
         return
  
-    # 3) WORK
+    # Command logic
     async with command_lock:
         await interaction.response.defer()
         try:
-            # --- 3a) Read + locate the user (O(1) lookup via the shared index helper).
+            # >> sudo locate user
             list_of_lists = await asyncio.to_thread(fetch_rank_columns)
             username_index = build_username_index(list_of_lists)
             row_idx = username_index.get(username.lower())
@@ -3502,13 +3480,13 @@ async def rank_command(interaction: discord.Interaction, username: str, rank: ap
                 return
  
             row = list_of_lists[row_idx]
-            display_name = get_cell(row, COL_USERNAME, username)   # exact casing from the sheet
+            display_name = get_cell(row, COL_USERNAME, username)
             old_rank = get_cell(row, COL_RANK, "N/A")
             designation = get_cell(row, COL_DESIGNATION, "N/A")
+            print(designation)
             new_rank = rank.value
             
- 
-            # --- 3b) Same rank already? Nothing to write, nothing to sort.
+            # Same rank as before -> no sorting
             if old_rank == new_rank:
                 await interaction.followup.send(
                     embed=make_embed(
@@ -3521,11 +3499,11 @@ async def rank_command(interaction: discord.Interaction, username: str, rank: ap
                 )
                 return
  
-            # --- 3c) Write the single rank cell (row_idx is 0-based, Cell wants 1-based).
+            # Write the cell with the new rank
             cell_list.append(Cell(row=row_idx + 1, col=COL_RANK + 1, value=new_rank))
             await update_cells(cell_list)
  
-            # --- 3d) Re-sort. A sorting failure doesn't undo the rank change, so only warn.
+            # Sort the rows
             sort_ok = True
             try:
                 await asyncio.to_thread(sort_users)
@@ -3533,14 +3511,14 @@ async def rank_command(interaction: discord.Interaction, username: str, rank: ap
                 sort_ok = False
                 print(f"WARNING: Rank change succeeded but sorting failed: {e}")
  
-            # --- 3e) Success embed.
+            # Success embed
             fields = [
                 ("Username", display_name, True),
                 ("Designation", designation, True),
                 ("Rank Change", f"{old_rank} → **{new_rank}**", False),
             ]
             if not sort_ok:
-                fields.append(("⚠️ Sorting Failed", "The rank was changed, but the Data sheet could not be re-sorted. Please sort it manually.", False))
+                fields.append(("Sorting Failed", "The rank was changed, but the Data sheet could not be sorted. Please sort it manually.", False))
  
             await interaction.followup.send(
                 embed=make_embed(
