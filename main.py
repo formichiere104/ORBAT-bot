@@ -277,12 +277,13 @@ REQUEST_TYPES = {
         "button_emoji": "📝",
         "button_style": discord.ButtonStyle.primary,
         "fields": [
-            {"key": "discord_username", "label": "Discord Username", "hint": "State your Discord username", "inline": True,  "max_len": 64},
-            {"key": "username",         "label": "Username",         "hint": "State your Username",         "inline": True,  "max_len": 100},
-            {"key": "rank",             "label": "Rank",             "hint": "State your rank",             "inline": True,  "max_len": 50},
-            {"key": "duration",         "label": "Duration",         "hint": "State the Duration of your Leave Of Absence", "inline": False, "max_len": 100},
-            {"key": "reason",           "label": "Reason",           "hint": "State your reason",           "inline": False, "max_len": 1000},
+            {"key": "discord_username", "label": "Discord Username", "hint": "Your Discord username", "inline": True,  "max_len": 64},
+            {"key": "username",         "label": "Username",         "hint": "Your Roblox username",         "inline": True,  "max_len": 100},
+            {"key": "rank",             "label": "Rank",             "hint": "Your rank",             "inline": True,  "max_len": 50},
+            {"key": "duration", "label": "Duration", "hint": "State the day of leave and the day of return as DD/MM/YYYY DD/MM/YYYY, e.g. 23/07/2026 27/07/2026", "type": "date_range", "inline": False, "max_len": 100},
+            {"key": "reason",           "label": "Reason",           "hint": "Your reason",           "inline": False, "max_len": 1000},
         ],
+        "file_on_accept": True,   # True = Accept also writes the request to the sheet (see ACCEPT_FILERS)
     },
     "discharge": {
         "prefix": "DIS",
@@ -295,13 +296,13 @@ REQUEST_TYPES = {
         "button_emoji": "🚪",
         "button_style": discord.ButtonStyle.danger,
         "fields": [
-            {"key": "discord_username", "label": "Discord Username", "hint": "State your Discord username", "inline": True,  "max_len": 64},
-            {"key": "username",         "label": "Username/Name",    "hint": "State your Username",         "inline": True,  "max_len": 100},
-            {"key": "rank",             "label": "Rank",             "hint": "State your rank",             "inline": True,  "max_len": 50},
-            {"key": "reason",           "label": "Reason",           "hint": "State your reason",           "inline": False, "max_len": 1000},
+            {"key": "discord_username", "label": "Discord Username", "hint": "Your Discord username", "inline": True,  "max_len": 64},
+            {"key": "username",         "label": "Username",    "hint": "Your Roblox username",         "inline": True,  "max_len": 100},
+            {"key": "rank",             "label": "Rank",             "hint": "Your rank",             "inline": True,  "max_len": 50},
+            {"key": "reason",           "label": "Reason",           "hint": "Your reason",           "inline": False, "max_len": 1000},
         ],
-        # --- Auto-filing on Accept ---
-        "files_discharge_on_accept": True, # False = Accept only updates the embed
+        # Auto filling on accept
+        "file_on_accept": True, # False = Accept only updates the embed
         "accepted_discharge_type": "Honorable", # must be a key of DISCHARGE_TYPES
     },
 }
@@ -2702,10 +2703,7 @@ def build_format_embed(kind, discord_username, errors=None):
  
  
 def build_request_embed(record):
-    """Builds the posted request embed from a log record. Used for the
-    first post AND for the in-place update after Accept/Deny, so both
-    always match. Everything it needs is stored in the record, so it never
-    has to look anything up from Discord."""
+    # Builds the posted request embed from a log record
     cfg = REQUEST_TYPES[record["type"]]
     status = record["status"]
     style = REQUEST_STATUS_STYLES.get(status)
@@ -2713,9 +2711,17 @@ def build_request_embed(record):
     embed = discord.Embed(title=cfg["title"], color=style["color"] if style else cfg["pending_color"])
     embed.set_author(name=record["submitter_name"], icon_url=record["submitter_icon"])
  
-    # The form answers, laid out exactly as configured (inline vs full-width).
+    # The form answers, laid out as configured
     for field in cfg["fields"]:
-        embed.add_field(name=field["label"], value=truncate_field(record["fields"].get(field["key"])), inline=field["inline"])
+        value = truncate_field(record["fields"].get(field["key"]))
+        if field.get("type") == "date_range":
+            # Append the total number of days under the dates
+            try:
+                days = parse_leave_period(record["fields"].get(field["key"], ""))[2]
+                value += f"\n**{days} day{'s' if days != 1 else ''}**"
+            except ValueError:
+                pass
+        embed.add_field(name=field["label"], value=value, inline=field["inline"])
  
     embed.add_field(name="Company", value=record["company"], inline=True)
     embed.add_field(name="Submitted by", value=f"<@{record['submitter_id']}>", inline=True)
@@ -2747,29 +2753,15 @@ def build_panel_embeds():
     ]
  
  
-# ----- D. Format parser ----------------------------------------------------------
+# ----- Format parser ----------------------------------------------------------
  
 def _normalize_label(text):
-    """'  **Username / Name** ' -> 'username/name' — so harmless differences
-    in case, spacing or bold/italic markers don't count as mistakes."""
     return re.sub(r"[\s*_`]+", "", text).lower()
  
  
 def parse_request_message(text, cfg):
-    """
-    Turns the user's reply into {field_key: value}.
-    Returns (values, errors): `errors` is a list of plain-language problems
-    (empty when everything is fine), so the user can fix ALL of them in one go
-    instead of being told about one mistake at a time.
- 
-    Rules:
-      • A line 'Label: value' starts a field (label matching is forgiving).
-      • Any other line continues the previous field, so a multi-line Reason
-        works, and so does 'Reason:' followed by the answer on the next line.
-      • A pasted code block (```) is fine — the fences are stripped.
-    Caught mistakes: text before the first field, a field written twice,
-    missing fields, empty fields, answers that are too long.
-    """
+    # Turns the user's reply into {field_key: value}
+
     fields = cfg["fields"]
     by_label = {_normalize_label(f["label"]): f for f in fields}
     text = re.sub(r"```[a-zA-Z]*", "", text) # drop code-fence markers if the format was pasted as a block
@@ -2813,6 +2805,14 @@ def parse_request_message(text, cfg):
             empty.append(field["label"])
         elif len(value) > field["max_len"]:
             errors.append(f"**{field['label']}** is too long ({len(value)}/{field['max_len']} characters).")
+        elif field.get("type") == "date_range":
+            # Two dates expected: validate, then store them in a clean normalized format
+            try:
+                leave, ret, _ = parse_leave_period(value, strict=True)
+            except ValueError as e:
+                errors.append(f"**{field['label']}**: {e}")
+            else:
+                values[field["key"]] = format_leave_period(leave, ret)
         else:
             values[field["key"]] = value
  
@@ -3044,32 +3044,61 @@ def build_orbat_note(result):
     return "\n".join(lines)
 
 
-async def accept_discharge_request(interaction, record):
-    cfg = REQUEST_TYPES[record["type"]]
+async def file_discharge_for_request(record, interaction):
+    # Filer for discharge requests: runs the shared /discharge logic. Returns the text for the 'ORBAT' embed field
+    result = await process_discharge(
+        username=record["fields"]["username"],
+        company_keys=discharge_company_keys_for(record),
+        discharge_type=REQUEST_TYPES[record["type"]]["accepted_discharge_type"],
+        reason=record["fields"]["reason"][:DISCHARGE_REASON_MAX],
+        signature=interaction.user.display_name,
+    )
+    return build_orbat_note(result)
 
-    # Same busy rule as every command that writes to the sheet
+
+async def file_loa_for_request(record, interaction):
+    # Filer for LOA requests: writes the leave onto the LOA sheet. Returns the text for the 'ORBAT' embed field
+    try:
+        leave, ret, _ = parse_leave_period(record["fields"]["duration"])
+    except ValueError:
+        raise LOAError(
+            "Invalid Dates",
+            "This request's dates can't be read. Deny it and ask the member to submit a new one.",
+        )
+    result = await process_loa(
+        username=record["fields"]["username"],
+        leave_date=leave,
+        return_date=ret,
+        reason=record["fields"]["reason"],
+    )
+    return build_loa_note(result)
+
+
+# request type -> function that files it. To auto-file a new request type write a filer and add one line here
+# A filer takes (record, interaction), returns the note text, and raises DischargeError/LOAError on expected failures
+ACCEPT_FILERS = {
+    "discharge": file_discharge_for_request,
+    "loa": file_loa_for_request,
+}
+
+
+async def accept_and_file(interaction, record):
+    # Accept = run the type's filer, then mark the request accepted. If filing fails, the request stays pending
+    # Busy rule
     if command_lock.locked():
         await interaction.response.send_message(embed=make_busy_embed(), ephemeral=True)
         return
 
     async with command_lock:
-        # Claim the request so a Deny (or another reviewer) can't slip in while the sheet work runs
-
+        # Claim the request
         record["status"] = "processing"
 
+        # 3s window
         await interaction.response.defer()
 
         try:
-            # Everything comes from the request
-            result = await process_discharge(
-                username=record["fields"]["username"],
-                company_keys=discharge_company_keys_for(record),
-                discharge_type=cfg["accepted_discharge_type"],
-                reason=record["fields"]["reason"][:DISCHARGE_REASON_MAX],  # request allows 1000 chars, the log 500
-                signature=interaction.user.display_name,
-            )
+            orbat_note = await ACCEPT_FILERS[record["type"]](record, interaction)
         except DischargeError as e:
-            # Expected failure
             record["status"] = "pending"
             await interaction.followup.send(
                 embed=make_error_embed(e.title, f"{e.message}\nThe request is still **pending**."), ephemeral=True
@@ -3077,9 +3106,9 @@ async def accept_discharge_request(interaction, record):
             return
         except Exception as e:
             record["status"] = "pending"
-            print(f"Error auto-filing discharge for {record['id']}: {e}")
+            print(f"Error auto-filing {record['id']}: {e}")
             await interaction.followup.send(
-                embed=make_error_embed("Something Went Wrong", "The ORBAT wasn't updated. The request is still **pending**."),
+                embed=make_error_embed("Something Went Wrong", "The sheet wasn't updated. The request is still **pending**."),
                 ephemeral=True,
             )
             return
@@ -3090,32 +3119,14 @@ async def accept_discharge_request(interaction, record):
             reviewer_id=interaction.user.id,
             reviewed_epoch=now_epoch(),
             denial_reason=None,
-            orbat_note=build_orbat_note(result),
+            orbat_note=orbat_note,
         )
         try:
-            # The interaction was deferred, so edit the original message through the interaction
             await interaction.edit_original_response(embed=build_request_embed(record), view=None)
         except discord.HTTPException as e:
-            print(f"Could not update embed of {record['id']} after discharge: {e}")
+            print(f"Could not update embed of {record['id']} after filing: {e}")
         await save_requests()
-        print(f"{record['id']} accepted by {interaction.user} -> discharged {result['display_name']}.")
-
-
-class DenyReasonModal(discord.ui.Modal, title="Deny Request"):
-    #Pop-up shown when a reviewer presses Deny
-    reason = discord.ui.TextInput(
-        label="Denial reason",
-        style=discord.TextStyle.paragraph,
-        placeholder="Why is this request being denied?",
-        required=True,
-        max_length=REQUEST_DENY_REASON_MAX,
-    )
- 
-    async def on_submit(self, interaction: discord.Interaction):
-        # Re-check everything: the request can sit open for a while
-        record = await RequestReviewView.authorize(interaction)
-        if record is not None:
-            await finalize_review(interaction, record, "denied", reason=self.reason.value.strip())
+        print(f"{record['id']} accepted by {interaction.user} and filed.")
  
  
 class RequestReviewView(discord.ui.View):
@@ -3159,9 +3170,9 @@ class RequestReviewView(discord.ui.View):
         record = await self.authorize(interaction)
         if record is None:
             return
-        # Request types flagged in the config also file the discharge on the ORBAT
-        if REQUEST_TYPES[record["type"]].get("files_discharge_on_accept"):
-            await accept_discharge_request(interaction, record)
+        # Types with "file_on_accept" also write to the sheet
+        if REQUEST_TYPES[record["type"]].get("file_on_accept") and record["type"] in ACCEPT_FILERS:
+            await accept_and_file(interaction, record)
         else:
             await finalize_review(interaction, record, "accepted")
  
@@ -3679,5 +3690,124 @@ async def rank_command(interaction: discord.Interaction, username: str, rank: ap
                 embed=make_error_embed("Something Went Wrong", "An error occurred while processing the command.")
             )
 
+# ============================================================
+# LOA SYSTEM  (sheet filing + date parsing)
+# ============================================================
+
+# ----- CONFIG ---------------------------------------------------------------
+
+LOA_SHEET_NAME = "442nd L.O.A."
+LOA_FIRST_DATA_ROW = 10 # first row that can hold an entry
+LOA_LOG_COLUMNS = {
+    "username": SHEET_USERNAME_COL,
+    "leave":    "F",
+    "return":   "G",
+    "reason":   "H",
+}
+LOA_DATE_FORMAT = "%d/%m/%Y"
+LOA_DATE_EXAMPLE = "23/07/2026 27/07/2026" # For error messages
+LOA_COUNT_INCLUSIVE = False # True: 23/07 -> 27/07 = 5 days (both ends count). False: 4 days
+LOA_MAX_DAYS = 30 # None = no limit
+
+# Matches DD/MM/YYYY (1 or 2 digit day/month)
+LOA_DATE_REGEX = re.compile(r"(?<!\d)(\d{1,2})/(\d{1,2})/(\d{4})(?!\d)")
+
+
+class LOAError(DischargeError):
+    # Expected LOA failure with a title + message (same shape as DischargeError)
+    pass
+
+
+# ----- DATE HELPERS ------------------------------------------------------------
+
+def parse_leave_period(text, strict=False):
+    # '23/07/2026 27/07/2026' -> (leave_date, return_date, total_days), as datetime.date objects + int.
+    # Collect every DD/MM/YYYY in the text. Separators between them (space, '-', 'to', ',') don't matter
+    matches = LOA_DATE_REGEX.findall(text)
+    if len(matches) != 2:
+        raise ValueError(
+            f"I need exactly **2 dates** (day of leave, then day of return) written as `DD/MM/YYYY`, "
+            f"e.g. `{LOA_DATE_EXAMPLE}`. I found {len(matches)}."
+        )
+
+    # Turn them into real dates
+    dates = []
+    for day, month, year in matches:
+        try:
+            dates.append(datetime(int(year), int(month), int(day)).date())
+        except ValueError:
+            raise ValueError(f"`{day}/{month}/{year}` isn't a real date.") from None
+    leave, ret = dates
+
+    # Order + total days
+    if ret < leave:
+        raise ValueError("The day of return can't be before the day of leave.")
+    days = (ret - leave).days + (1 if LOA_COUNT_INCLUSIVE else 0)
+
+    # Extra checks
+    if strict:
+        if ret < datetime.now(timezone.utc).date():
+            raise ValueError("The day of return is already in the past.")
+        if LOA_MAX_DAYS and days > LOA_MAX_DAYS:
+            raise ValueError(f"A Leave of Absence can't be longer than {LOA_MAX_DAYS} days ({days} entered). Check the year.")
+
+    return leave, ret, days
+
+
+def format_leave_period(leave, ret):
+    # (date, date) -> '23/07/2026 - 27/07/2026' format stored in the request log
+    return f"{leave.strftime(LOA_DATE_FORMAT)} - {ret.strftime(LOA_DATE_FORMAT)}"
+
+
+# ----- SHEET I/O -----------------------------------------------------------------
+
+def fetch_loa_username_column():
+    # One request
+    response = sh.values_batch_get([quoted_range(LOA_SHEET_NAME, f"{SHEET_USERNAME_COL}:{SHEET_USERNAME_COL}")])
+    return response["valueRanges"][0].get("values", [])
+
+
+# ----- LOGIC ----------------------------------------------------------------
+
+async def process_loa(username, leave_date, return_date, reason):
+    # The place that files a LOA request
+    try:
+        # Read the username column and find the first empty row
+        column = await asyncio.to_thread(fetch_loa_username_column)
+        row = first_free_row(column, LOA_FIRST_DATA_ROW)
+
+        # What goes in each column
+        values = {
+            "username": sheet_safe_text(username.strip()),
+            "leave":    leave_date.strftime(LOA_DATE_FORMAT),
+            "return":   return_date.strftime(LOA_DATE_FORMAT),
+            "reason":   sheet_safe_text(reason),
+        }
+
+        # One range per column
+        updates = [
+            {"range": quoted_range(LOA_SHEET_NAME, f"{column_letter}{row}"), "values": [[values[key]]]}
+            for key, column_letter in LOA_LOG_COLUMNS.items()
+        ]
+        await asyncio.to_thread(write_discharge_updates, updates)   # generic batch writer, reused as is
+
+    except APIError as e:
+        print(f"Google Sheets API error in LOA: {e}")
+        raise LOAError(
+            "Sheets Error",
+            f"Google rejected the request. Check the tab name (`{LOA_SHEET_NAME}`) and that the bot can edit it. "
+            "Nothing was changed.",
+        ) from e
+
+    days = (return_date - leave_date).days + (1 if LOA_COUNT_INCLUSIVE else 0)
+    return {"row": row, "username": username.strip(), "leave": values["leave"], "return": values["return"], "days": days}
+
+
+def build_loa_note(result):
+    # Turns process_loa()'s result into the small ORBAT field shown on the request embed
+    return (
+        f"📁 Filed in {LOA_SHEET_NAME} (row {result['row']})\n"
+        f"🗓️ {result['leave']} → {result['return']} • **{result['days']} day{'s' if result['days'] != 1 else ''}**"
+    )
 
 bot.run(DISCORD_BOT_TOKEN)
