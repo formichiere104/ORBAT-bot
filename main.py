@@ -34,6 +34,7 @@ import requests
 import asyncio
 import aiohttp
 import re
+import urllib.request, urllib.error
 
 from datetime import datetime, timezone, timedelta
 
@@ -97,6 +98,7 @@ DISPLAY_RANK_ORDER = [r for r in reversed(ranks) if r != "Cadet"]
 ROBLOX_GROUPS = {
     "442nd Battalion": 990610899,
     "GAR": 1092793046,
+    "Navy": 964195468,
 }
  
 ROBLOX_API_TIMEOUT = 10  # seconds, per individual Roblox API request
@@ -248,9 +250,9 @@ REQUEST_REVIEWER_ROLE_IDS = {
 # ⚠️ CHECK THE NAMES: I matched them to your role IDs in the order you gave
 # them (Horn, Doom, Viper) — swap them if that's not the right order.
 REQUEST_COMPANIES = {
-    1554139371647533127: {"name": "Horn Company",  "hq_role_id": 1554139229003452426},
-    1554139402488389693: {"name": "Doom Company",  "hq_role_id": 1554139296758505492},
-    1554139434318962868: {"name": "Viper Company", "hq_role_id": 1554139344292421735},
+    1554139371647533127: {"name": "Horn Company",  "hq_role_id": 1554139229003452426, "discharge_key": "horn"},
+    1554139402488389693: {"name": "Doom Company",  "hq_role_id": 1554139296758505492, "discharge_key": "doom"},
+    1554139434318962868: {"name": "Viper Company", "hq_role_id": 1554139344292421735, "discharge_key": "viper"},
 }
 # Shown when the submitter has NO company role, or MORE THAN ONE (no HQ is pinged then).
 REQUEST_COMPANY_FALLBACK = "N/A"
@@ -298,6 +300,9 @@ REQUEST_TYPES = {
             {"key": "rank",             "label": "Rank",             "hint": "State your rank",             "inline": True,  "max_len": 50},
             {"key": "reason",           "label": "Reason",           "hint": "State your reason",           "inline": False, "max_len": 1000},
         ],
+        # --- Auto-filing on Accept ---
+        "files_discharge_on_accept": True, # False = Accept only updates the embed
+        "accepted_discharge_type": "Honorable", # must be a key of DISCHARGE_TYPES
     },
 }
  
@@ -509,31 +514,44 @@ def make_busy_embed():
 # helper is written to FAIL SAFE: one flaky/rate-limited endpoint just
 # makes that one field show "Unknown" in the embed, instead of taking down
 # the whole command (same philosophy as safe_int/get_cell above).
- 
-async def roblox_get_json(session, url, method="GET", json_body=None):
-    """Thin wrapper every call below goes through, so the one try/except
-    for 'this endpoint misbehaved' lives in a single place instead of
-    being copy-pasted for every Roblox API call."""
+
+class RobloxAPIError(Exception):
+    # Raised when Roblox answers with an error (blocked IP, rate limit, outage)
+    pass 
+
+def _blocking_roblox_request(url, method, json_body, timeout):
+    data = json.dumps(json_body).encode() if json_body is not None else None
+    headers = {"Content-Type": "application/json"} if data is not None else {}
+    request = urllib.request.Request(url, data=data, method=method, headers=headers)
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        return json.loads(response.read().decode())
+
+
+async def roblox_get_json(session, url, method="GET", json_body=None, strict=False):
+    # strict=True  -> raise RobloxAPIError on failure
+    # strict=False -> return None, so optional fields just show 'Unknown'
     try:
-        async with session.request(
-            method, url, json=json_body, timeout=aiohttp.ClientTimeout(total=ROBLOX_API_TIMEOUT)
-        ) as resp:
-            if resp.status != 200:
-                return None
-            return await resp.json()
-    except (aiohttp.ClientError, asyncio.TimeoutError, ValueError):
+        # to_thread keeps the event loop free; the 7 profile calls still run concurrently via asyncio.gather
+        return await asyncio.to_thread(_blocking_roblox_request, url, method, json_body, ROBLOX_API_TIMEOUT)
+    except urllib.error.HTTPError as e: # must come first: HTTPError is a subclass of URLError
+        print(f"Roblox API {e.code} for {url}")
+    except (urllib.error.URLError, TimeoutError, OSError, ValueError) as e:
+        print(f"Roblox API request failed for {url}: {e!r}")
+        if strict:
+            raise RobloxAPIError(str(e)) from e
         return None
- 
- 
+    if strict:
+        raise RobloxAPIError("bad HTTP status")
+    return None
+
+
 async def roblox_get_user_id(session, username):
-    """Resolves a Roblox username -> (user_id, canonical_name) via the
-    bulk username-lookup endpoint (case-insensitive, exact match only).
-    Returns (None, None) if no such account exists."""
     data = await roblox_get_json(
         session,
         "https://users.roblox.com/v1/usernames/users",
         method="POST",
         json_body={"usernames": [username], "excludeBannedUsers": False},
+        strict=True,
     )
     if not data or not data.get("data"):
         return None, None
@@ -1514,7 +1532,12 @@ async def bgcheck(interaction: discord.Interaction, roblox_username: str):
  
         embed = make_bgcheck_embed(interaction, roblox_id, profile)
         await interaction.followup.send(embed=embed)
- 
+
+    except RobloxAPIError as e:
+        await interaction.followup.send(
+            embed=make_error_embed("Roblox API Unavailable", f"Roblox didn't answer properly ({e}). Try again later.")
+        )
+    
     except Exception as e:
         print(f"Error in bgcheck: {e}")
         await interaction.followup.send(
@@ -2567,13 +2590,15 @@ def load_requests():
  
     request_log.update(raw)
     for request_id, record in raw.items():
+        if record.get("status") == "processing": # bot died mid-discharge -> make it reviewable again
+            record["status"] = "pending"
         prefix, _, number = request_id.rpartition("-")
         request_counters[prefix] = max(request_counters.get(prefix, 0), safe_int(number))
         if record.get("message_id"):
             request_message_index[record["message_id"]] = request_id
  
  
-# ----- B. Small helpers ------------------------------------------------------
+# ----- helpers ------------------------------------------------------
  
 def now_epoch():
     return int(datetime.now(timezone.utc).timestamp())
@@ -2701,7 +2726,11 @@ def build_request_embed(record):
     else:
         status_text = REQUEST_PENDING_TEXT
     embed.add_field(name="Status", value=status_text, inline=False)
- 
+
+    # Summary of what the auto-discharge did on the ORBAT (only exists on accepted discharges)
+    if record.get("orbat_note"):
+        embed.add_field(name="ORBAT", value=truncate_field(record["orbat_note"]), inline=False)
+    
     if status == "denied":
         embed.add_field(name="Denial Reason", value=truncate_field(record.get("denial_reason")), inline=False)
  
@@ -2992,7 +3021,86 @@ async def finalize_review(interaction, record, decision, reason=None):
     await save_requests()
     print(f"{record['id']} {decision} by {interaction.user}.")
  
- 
+def discharge_company_keys_for(record):
+    #Which company sheet(s) to clear for this request
+    for info in REQUEST_COMPANIES.values():
+        if info["name"] == record["company"] and info.get("discharge_key") in DISCHARGE_COMPANIES:
+            return [info["discharge_key"]]
+    return list(DISCHARGE_COMPANIES)
+
+
+def build_orbat_note(result):
+    #Turns process_discharge()'s result into the small 'ORBAT' field shown on the request embed
+    lines = [
+        f"**{result['designation']}** • {result['previous_rank']}",
+        f"Filed in {DISCHARGE_SHEET_NAME} (row {result['log_row']})",
+        "✅ Data sheet",
+    ]
+    lines += [f"✅ {name}" for name in result["company_hits"]]
+    if result["school_removed"]:
+        lines.append(f"✅ {DISCHARGE_SCHOOL_SHEET_NAME}")
+    if not result["sort_ok"]:
+        lines.append("Sorting failed, please sort the Data sheet manually.")
+    return "\n".join(lines)
+
+
+async def accept_discharge_request(interaction, record):
+    cfg = REQUEST_TYPES[record["type"]]
+
+    # Same busy rule as every command that writes to the sheet
+    if command_lock.locked():
+        await interaction.response.send_message(embed=make_busy_embed(), ephemeral=True)
+        return
+
+    async with command_lock:
+        # Claim the request so a Deny (or another reviewer) can't slip in while the sheet work runs
+
+        record["status"] = "processing"
+
+        await interaction.response.defer()
+
+        try:
+            # Everything comes from the request
+            result = await process_discharge(
+                username=record["fields"]["username"],
+                company_keys=discharge_company_keys_for(record),
+                discharge_type=cfg["accepted_discharge_type"],
+                reason=record["fields"]["reason"][:DISCHARGE_REASON_MAX],  # request allows 1000 chars, the log 500
+                signature=interaction.user.display_name,
+            )
+        except DischargeError as e:
+            # Expected failure
+            record["status"] = "pending"
+            await interaction.followup.send(
+                embed=make_error_embed(e.title, f"{e.message}\nThe request is still **pending**."), ephemeral=True
+            )
+            return
+        except Exception as e:
+            record["status"] = "pending"
+            print(f"Error auto-filing discharge for {record['id']}: {e}")
+            await interaction.followup.send(
+                embed=make_error_embed("Something Went Wrong", "The ORBAT wasn't updated. The request is still **pending**."),
+                ephemeral=True,
+            )
+            return
+
+        # Success
+        record.update(
+            status="accepted",
+            reviewer_id=interaction.user.id,
+            reviewed_epoch=now_epoch(),
+            denial_reason=None,
+            orbat_note=build_orbat_note(result),
+        )
+        try:
+            # The interaction was deferred, so edit the original message through the interaction
+            await interaction.edit_original_response(embed=build_request_embed(record), view=None)
+        except discord.HTTPException as e:
+            print(f"Could not update embed of {record['id']} after discharge: {e}")
+        await save_requests()
+        print(f"{record['id']} accepted by {interaction.user} -> discharged {result['display_name']}.")
+
+
 class DenyReasonModal(discord.ui.Modal, title="Deny Request"):
     #Pop-up shown when a reviewer presses Deny
     reason = discord.ui.TextInput(
@@ -3049,7 +3157,12 @@ class RequestReviewView(discord.ui.View):
     @discord.ui.button(label="Accept", emoji="✅", style=discord.ButtonStyle.success, custom_id="request_review_accept")
     async def accept_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         record = await self.authorize(interaction)
-        if record is not None:
+        if record is None:
+            return
+        # Request types flagged in the config also file the discharge on the ORBAT
+        if REQUEST_TYPES[record["type"]].get("files_discharge_on_accept"):
+            await accept_discharge_request(interaction, record)
+        else:
             await finalize_review(interaction, record, "accepted")
  
     @discord.ui.button(label="Deny", emoji="❌", style=discord.ButtonStyle.danger, custom_id="request_review_deny")
@@ -3239,26 +3352,119 @@ def first_free_row(column_values, start_row):
  
 # ----- SHEET I/O -----------------------------------------------------------------
  
-def fetch_discharge_data(company_sheet_name):
-    # One request that reads the needed column/s of discharge, company, and data sheets
+def fetch_discharge_data(company_sheet_names):
+    # Request that reads the username column of: Data, DISCHARGE, SCHOOL + every given company sheet
     username_col = f"{SHEET_USERNAME_COL}:{SHEET_USERNAME_COL}"
-    response = sh.values_batch_get([
+    ranges = [
         quoted_range(sheet.title, f"A1:F{DATA_END_ROW}"),
         quoted_range(DISCHARGE_SHEET_NAME, username_col),
-        quoted_range(company_sheet_name, username_col),
         quoted_range(DISCHARGE_SCHOOL_SHEET_NAME, username_col),
-    ])
+        *(quoted_range(name, username_col) for name in company_sheet_names),
+    ]
+    response = sh.values_batch_get(ranges)
     # An entirely empty range comes back without a "values" key -> default to []
-    data_rows, discharge_col, company_col, school_col = (
-        value_range.get("values", []) for value_range in response["valueRanges"]
-    )
-    return data_rows, discharge_col, company_col, school_col
+    columns = [value_range.get("values", []) for value_range in response["valueRanges"]]
+    data_rows, discharge_col, school_col, *company_cols = columns
+    return data_rows, discharge_col, school_col, dict(zip(company_sheet_names, company_cols))
  
  
 def write_discharge_updates(updates):
     # The single batch-write for all changes
     sh.values_batch_update({"valueInputOption": "USER_ENTERED", "data": updates})
- 
+
+class DischargeError(Exception):
+    #Expected failure with a ready-to-show title + message. Callers catch it and show it however they like
+    def __init__(self, title, message):
+        super().__init__(message)
+        self.title = title
+        self.message = message
+
+
+async def process_discharge(username, company_keys, discharge_type, reason, signature):
+    company_sheet_names = [DISCHARGE_COMPANIES[key]["sheet"] for key in company_keys]
+
+    try:
+        # One batch read for every sheet we need
+        data_rows, discharge_col, school_col, company_cols = await asyncio.to_thread(
+            fetch_discharge_data, company_sheet_names
+        )
+
+        # Find the member in the Data sheet
+        data_idx = build_username_index(data_rows).get(username.strip().lower())
+        if data_idx is None:
+            raise DischargeError(
+                "Record Not Found", f"No record found for **{username}** in the Data sheet. Nothing was changed."
+            )
+        data_row = data_rows[data_idx]
+        display_name = get_cell(data_row, COL_USERNAME, username)
+        designation = get_cell(data_row, COL_DESIGNATION, "N/A")
+        previous_rank = get_cell(data_row, COL_RANK, "N/A")
+        data_row_number = data_idx + 1
+
+        # Collect every change in one list, written in a single batch at the end
+        updates = []
+
+        # Log line in the 442nd DISCHARGE sheet
+        log_row = first_free_row(discharge_col, DISCHARGE_FIRST_DATA_ROW)
+        log_values = {
+            "designation": designation,
+            "username":    display_name,
+            "date":        datetime.now().strftime(DISCHARGE_DATE_FORMAT),
+            "type":        discharge_type,
+            "reason":      reason,
+            "signature":   signature,
+        }
+        for key, column in DISCHARGE_LOG_COLUMNS.items():
+            value = sheet_safe_text(log_values[key]) if key in ("reason", "signature", "designation") else log_values[key]
+            updates.append({"range": quoted_range(DISCHARGE_SHEET_NAME, f"{column}{log_row}"), "values": [[value]]})
+
+        # Wipe the member from each company sheet where they appear
+        company_hits = []
+        for sheet_name, column_values in company_cols.items():
+            rows = find_rows(column_values, display_name)
+            for row_number in rows:
+                updates += build_rule_updates(sheet_name, row_number, COMPANY_WIPE_RULES)
+            if rows:
+                company_hits.append(sheet_name)
+
+        # School sheet: clear username + untick checkboxes
+        school_rows = find_rows(school_col, display_name)
+        for row_number in school_rows:
+            updates += build_rule_updates(DISCHARGE_SCHOOL_SHEET_NAME, row_number, SCHOOL_WIPE_RULES)
+
+        # Reset their row in the Data sheet
+        updates += build_rule_updates(sheet.title, data_row_number, DATA_WIPE_RULES)
+
+        # Single batch write
+        await asyncio.to_thread(write_discharge_updates, updates)
+
+    except APIError as e:
+        # Most common cause: the service account lacks access to protected cells, or a sheet name is wrong
+        print(f"Google Sheets API error in discharge: {e}")
+        raise DischargeError(
+            "Sheets Error",
+            "Google rejected the request. Check that the bot has the necessary permissions on the ORBAT. "
+            "Nothing was changed.",
+        ) from e
+
+    # Sort the Data sheet
+    sort_ok = True
+    try:
+        await asyncio.to_thread(sort_users)
+    except Exception as e:
+        sort_ok = False
+        print(f"WARNING: Discharge succeeded but sorting failed: {e}")
+
+    return {
+        "display_name": display_name,
+        "designation": designation,
+        "previous_rank": previous_rank,
+        "log_row": log_row,
+        "company_sheets_checked": company_sheet_names,
+        "company_hits": company_hits,
+        "school_removed": bool(school_rows),
+        "sort_ok": sort_ok,
+    }
  
 # ----- COMMAND ---------------------------------------------------------------
  
@@ -3300,118 +3506,54 @@ async def discharge(
  
     company_cfg = DISCHARGE_COMPANIES[company.value]
     type_cfg = DISCHARGE_TYPES[discharge_type.value]
- 
-    # Logic logic logic
+
     async with command_lock:
         await interaction.response.defer()
         try:
-            # One batch-read for all 4 sheets
-            data_rows, discharge_col, company_col, school_col = await asyncio.to_thread(
-                fetch_discharge_data, company_cfg["sheet"]
+            # All the sheet work now lives in process_discharge()
+            result = await process_discharge(
+                username=username,
+                company_keys=[company.value],
+                discharge_type=discharge_type.value,
+                reason=reason,
+                signature=interaction.user.display_name, # server nickname, e.g. CT-4358 "Luke"
             )
- 
-            # Find user in Data sheet
-            username_index = build_username_index(data_rows)
-            data_idx = username_index.get(username.lower())
-            if data_idx is None:
-                await interaction.followup.send(
-                    embed=make_error_embed(
-                        "Record Not Found",
-                        f"No record found for **{username}** in the Data sheet. Nothing was changed.",
-                    )
-                )
-                return
- 
-            data_row = data_rows[data_idx]
-            display_name = get_cell(data_row, COL_USERNAME, username)
-            designation = get_cell(data_row, COL_DESIGNATION, "N/A")
-            previous_rank = get_cell(data_row, COL_RANK, "N/A")
-            data_row_number = data_idx + 1
- 
-            # Compile every change into a single list
-            updates = []
- 
-            # 442nd DISCHARGE sheet
-            log_row = first_free_row(discharge_col, DISCHARGE_FIRST_DATA_ROW)
-            log_values = {
-                "designation": designation,
-                "username":    display_name,
-                "date":        datetime.now().strftime(DISCHARGE_DATE_FORMAT),
-                "type":        discharge_type.value,
-                "reason":      reason,
-                # server nickname, e.g. CT-4358 "Luke"
-                "signature":   interaction.user.display_name,
-            }
-            for key, column in DISCHARGE_LOG_COLUMNS.items():
-                value = sheet_safe_text(log_values[key]) if key in ("reason", "signature", "designation") else log_values[key]
-                updates.append({
-                    "range": quoted_range(DISCHARGE_SHEET_NAME, f"{column}{log_row}"),
-                    "values": [[value]],
-                })
- 
-            # Clear username from company sheet
-            company_rows = find_rows(company_col, display_name)
-            for row_number in company_rows:
-                updates += build_rule_updates(company_cfg["sheet"], row_number, COMPANY_WIPE_RULES)
- 
-            # Clear username and reset checkboxes in school sheet
-            school_rows = find_rows(school_col, display_name)
-            for row_number in school_rows:
-                updates += build_rule_updates(DISCHARGE_SCHOOL_SHEET_NAME, row_number, SCHOOL_WIPE_RULES)
- 
-            # Clear row in Data sheet
-            updates += build_rule_updates(sheet.title, data_row_number, DATA_WIPE_RULES)
- 
-            # One single batch write for all (to avoid 2000 API calls)
-            await asyncio.to_thread(write_discharge_updates, updates)
- 
-            # Sorting the Data sheet
-            sort_ok = True
-            try:
-                await asyncio.to_thread(sort_users)
-            except Exception as e:
-                sort_ok = False
-                print(f"WARNING: Discharge succeeded but sorting failed: {e}")
- 
-            # Success embed
-            removed_lines = [
-                "✅ Data sheet",
-                f"✅ {company_cfg['sheet']}" if company_rows else f"➖ {company_cfg['sheet']}",
-                f"✅ {DISCHARGE_SCHOOL_SHEET_NAME}" if school_rows else f"➖ {DISCHARGE_SCHOOL_SHEET_NAME}",
+
+            # Success embed: ✅ = cleared, ➖ = member wasn't on that sheet
+            removed_lines = ["✅ Data sheet"]
+            removed_lines += [
+                f"✅ {name}" if name in result["company_hits"] else f"➖ {name}"
+                for name in result["company_sheets_checked"]
             ]
+            removed_lines.append(
+                f"✅ {DISCHARGE_SCHOOL_SHEET_NAME}" if result["school_removed"] else f"➖ {DISCHARGE_SCHOOL_SHEET_NAME}"
+            )
             fields = [
-                ("Username", display_name, True),
-                ("Designation", designation, True),
-                ("Previous Rank", previous_rank, True),
+                ("Username", result["display_name"], True),
+                ("Designation", result["designation"], True),
+                ("Previous Rank", result["previous_rank"], True),
                 ("Company", company_cfg["label"], True),
                 ("Type", f"{type_cfg['emoji']} {discharge_type.value}", True),
-                ("Filed In", f"{DISCHARGE_SHEET_NAME} (row {log_row})", True),
+                ("Filed In", f"{DISCHARGE_SHEET_NAME} (row {result['log_row']})", True),
                 ("Reason", reason, False),
                 ("Removed From", "\n".join(removed_lines), False),
             ]
-            if not sort_ok:
+            if not result["sort_ok"]:
                 fields.append(("Sorting Failed", "The discharge went through, but the Data sheet could not be sorted. Please sort it manually.", False))
- 
-            embed = make_embed(
-                interaction,
-                title=f"{type_cfg['emoji']} Discharge Filed | {display_name}",
-                color=type_cfg["color"],
-                fields=fields,
-                verb="Updated",
-            )
-            await interaction.followup.send(embed=embed)
-            print(f"Discharged {display_name} ({discharge_type.value}) by {interaction.user}.")
- 
-        except APIError as e:
-            # Most common cause: the google service account doesn't have access to protected cells, or the name of the sheets isn't configured properly
-            print(f"Google Sheets API error in discharge: {e}")
+
             await interaction.followup.send(
-                embed=make_error_embed(
-                    "Sheets Error",
-                    "Google rejected the request. Check that the bot has the necessary "
-                    "permissions on the ORBAT. Nothing was changed.",
+                embed=make_embed(
+                    interaction,
+                    title=f"{type_cfg['emoji']} Discharge Filed | {result['display_name']}",
+                    color=type_cfg["color"],
+                    fields=fields,
+                    verb="Updated",
                 )
             )
+            print(f"Discharged {result['display_name']} ({discharge_type.value}) by {interaction.user}.")
+
+        except DischargeError as e:
+            await interaction.followup.send(embed=make_error_embed(e.title, e.message))
         except Exception as e:
             print(f"Error in discharge: {e}")
             await interaction.followup.send(
