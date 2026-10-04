@@ -46,9 +46,6 @@ from dotenv import load_dotenv
 load_dotenv()
 
 def require_env(name: str) -> str:
-    """Reads a required secret from the environment and fails LOUD and
-    EARLY (at startup) if it's missing, instead of the bot silently
-    crashing later the first time something tries to use it."""
     value = os.environ.get(name)
     if not value:
         raise RuntimeError(
@@ -576,44 +573,24 @@ async def roblox_get_group_ranks(session, user_id, group_ids):
  
  
 async def get_verified_discord_status(session, roblox_user_id):
-    """
-    Roblox itself has no concept of "verified Discord" — bots that show
-    this field (like the one in the reference screenshot) are querying a
-    third-party account-linking service such as Bloxlink or RoVer, which
-    requires YOUR OWN API key from that service.
- 
-    This is intentionally left as a stub so /bgcheck works out of the box
-    without one: set BLOXLINK_API_KEY above and fill in the real request
-    below once you have a key. Until then it always reports "Not Configured".
-    """
     if not BLOXLINK_API_KEY:
         return "Not Configured"
-    # Example shape once you have a Bloxlink API key (check their current
-    # docs before relying on this — it's a third-party, versioned API, not
-    # a Roblox one, so the exact endpoint/auth format can change):
-    #
+
     data = await roblox_get_json(
         session,
         f"https://api.blox.link/v4/public/guilds/{GUILD_ID}/roblox-to-discord/{roblox_user_id}",
-    )  # would need an Authorization header with BLOXLINK_API_KEY
+    ) # would need an Authorization header with BLOXLINK_API_KEY
     return "Yes" if data and data.get("discordIDs") else "No"
  
  
 async def fetch_roblox_profile(session, user_id, group_ids):
-    """
-    Fires every profile-detail request CONCURRENTLY via asyncio.gather —
-    Roblox splits this data across several separate services (users/,
-    friends/, groups/, premiumfeatures/, thumbnails/), so there's no single
-    call that returns it all. Gathering them means /bgcheck's total wait is
-    roughly the SLOWEST single call, not the sum of all seven of them.
-    """
-    details, history, friends_count, followers_count, group_ranks, premium_raw, thumbnail = await asyncio.gather(
+    # Fires every profile-detail request CONCURRENTLY via asyncio.gather
+    details, history, friends_count, followers_count, group_ranks, thumbnail = await asyncio.gather(
         roblox_get_json(session, f"https://users.roblox.com/v1/users/{user_id}"),
         roblox_get_json(session, f"https://users.roblox.com/v1/users/{user_id}/username-history?limit=10&sortOrder=Desc"),
         roblox_get_json(session, f"https://friends.roblox.com/v1/users/{user_id}/friends/count"),
         roblox_get_json(session, f"https://friends.roblox.com/v1/users/{user_id}/followers/count"),
         roblox_get_group_ranks(session, user_id, group_ids),
-        roblox_get_json(session, f"https://premiumfeatures.roblox.com/v1/users/{user_id}/validate-membership"),
         roblox_get_json(
             session,
             f"https://thumbnails.roblox.com/v1/users/avatar-headshot?userIds={user_id}&size=420x420&format=Png&isCircular=false",
@@ -624,9 +601,6 @@ async def fetch_roblox_profile(session, user_id, group_ids):
  
     created_str = (details or {}).get("created")
     if created_str:
-        # Roblox timestamps look like "2019-05-06T12:34:56.789Z" — slice to
-        # the whole-second part and mark it UTC explicitly (avoids the
-        # deprecated naive-utcnow() pattern and keeps the day-count correct).
         created_date = datetime.strptime(created_str[:19], "%Y-%m-%dT%H:%M:%S").replace(tzinfo=timezone.utc)
         age_days = (datetime.now(timezone.utc) - created_date).days
         age_text = f"{age_days} ({created_date.day} {created_date.strftime('%b %Y')})"
@@ -640,7 +614,6 @@ async def fetch_roblox_profile(session, user_id, group_ids):
     return {
         "name": (details or {}).get("name", "Unknown"),
         "past_names": ", ".join(past_names) if past_names else "-",
-        "premium": premium_raw if isinstance(premium_raw, bool) else "Unknown",
         "friends": friends_count.get("count", "Unknown") if friends_count else "Unknown",
         "followers": followers_count.get("count", "Unknown") if followers_count else "Unknown",
         "age_text": age_text,
@@ -650,23 +623,13 @@ async def fetch_roblox_profile(session, user_id, group_ids):
  
  
 def make_bgcheck_embed(interaction, roblox_id, profile):
-    """Builds the /bgcheck embed. The title links straight to the Roblox
-    profile (click the header — same as the reference screenshot); the
-    'Profile URL' field repeats the same link as visible clickable text."""
+    # Builds the /bgcheck embed
     profile_url = f"https://www.roblox.com/users/{roblox_id}/profile"
- 
-    if profile["premium"] is True:
-        premium_text = "Yes"
-    elif profile["premium"] is False:
-        premium_text = "No"
-    else:
-        premium_text = "Unknown"
  
     fields = [
         ("Name", profile["name"], True),
         ("Past Names", profile["past_names"], True),
         ("ID", str(roblox_id), True),
-        ("Premium", premium_text, True),
         ("Profile URL", f"[Click Here]({profile_url})", True),
         ("Verified Discord", profile["verified_discord"], True),
         (
@@ -691,7 +654,7 @@ def make_bgcheck_embed(interaction, roblox_id, profile):
         fields=fields,
         verb="Requested",
     )
-    embed.url = profile_url  # makes the embed TITLE itself clickable
+    embed.url = profile_url
     if profile["thumbnail_url"]:
         embed.set_thumbnail(url=profile["thumbnail_url"])
     return embed
@@ -3712,6 +3675,21 @@ LOA_MAX_DAYS = 30 # None = no limit
 # Matches DD/MM/YYYY (1 or 2 digit day/month)
 LOA_DATE_REGEX = re.compile(r"(?<!\d)(\d{1,2})/(\d{1,2})/(\d{4})(?!\d)")
 
+# --- /loa and /removeloa -----------------------------------------------------
+LOA_COMMAND_DATE_FORMAT  = "%d/%m/%Y" # what /loa accepts (strptime pattern). The SHEET format is still LOA_DATE_FORMAT.
+LOA_COMMAND_DATE_HINT    = "DD/MM/YYYY" # shown in error messages
+LOA_COMMAND_DATE_EXAMPLE = "23/07/2026"
+LOA_REASON_MAX           = 1000 # same cap as the request form
+LOA_COLOR_ADDED          = EMBED_COLOR_SUCCESS
+LOA_COLOR_REMOVED        = 0xE67E22 # orange
+
+# /removeloa wipe rules: same format as DATA_WIPE_RULES ("F" = one column, "F:G" = a span, "" = empty the cell).
+LOA_WIPE_RULES = [
+    (SHEET_USERNAME_COL, ""),
+    ("F:G", ""),
+    ("H", ""),
+]
+
 
 class LOAError(DischargeError):
     # Expected LOA failure with a title + message (same shape as DischargeError)
@@ -3720,8 +3698,76 @@ class LOAError(DischargeError):
 
 # ----- DATE HELPERS ------------------------------------------------------------
 
+def parse_loa_command_date(text, label):
+    # Turns what was typed in /loa into a datetime.date, or raises a readable ValueError
+    text = text.strip()
+    try:
+        return datetime.strptime(text, LOA_COMMAND_DATE_FORMAT).date()
+    except ValueError:
+        raise ValueError(
+            f"**{label}** `{text}` isn't a valid date. Use `{LOA_COMMAND_DATE_HINT}`, e.g. `{LOA_COMMAND_DATE_EXAMPLE}`."
+        ) from None
+
+
+def fetch_loa_entries():
+    last_col = max(LOA_LOG_COLUMNS.values(), key=col_number)
+    response = sh.values_batch_get([quoted_range(LOA_SHEET_NAME, f"{SHEET_USERNAME_COL}:{last_col}")])
+    return response["valueRanges"][0].get("values", [])
+
+
+async def process_remove_loa(username):
+    try:
+        table = await asyncio.to_thread(fetch_loa_entries)
+
+        # Every matching row
+        rows = [r for r in find_rows(table, username) if r >= LOA_FIRST_DATA_ROW]
+        if not rows:
+            raise LOAError("No LOA Found", f"**{username}** has no entry in the {LOA_SHEET_NAME} sheet. Nothing was changed.")
+
+        def cell(row_values, key):
+            offset = col_number(LOA_LOG_COLUMNS[key]) - col_number(SHEET_USERNAME_COL)
+            return get_cell(row_values, offset, "—")
+
+        entries, updates = [], []
+        for row_number in rows:
+            row_values = table[row_number - 1]
+            entries.append({
+                "row": row_number,
+                "leave": cell(row_values, "leave"),
+                "return": cell(row_values, "return"),
+                "reason": cell(row_values, "reason"),
+            })
+            updates += build_rule_updates(LOA_SHEET_NAME, row_number, LOA_WIPE_RULES)
+
+        # Batch write for all rows
+        await asyncio.to_thread(write_discharge_updates, updates)
+
+    except APIError as e:
+        print(f"Google Sheets API error in removeloa: {e}")
+        raise LOAError(
+            "Sheets Error",
+            f"Google rejected the request. Check the tab name (`{LOA_SHEET_NAME}`) and that the bot can edit it. "
+            "Nothing was changed.",
+        ) from e
+
+    return {"display_name": get_cell(table[rows[0] - 1], 0, username), "entries": entries}
+
+def check_leave_dates(leave, ret, strict=False):
+    # Validates two datetime.date objects and returns the total number of days
+    # strict=False only checks the order
+    # strict=True also rejects a return date in the past and periods over LOA_MAX_DAYS (new submissions)
+    if ret < leave:
+        raise ValueError("The day of return can't be before the day of leave.")
+    days = (ret - leave).days + (1 if LOA_COUNT_INCLUSIVE else 0)
+    if strict:
+        if ret < datetime.now(timezone.utc).date():
+            raise ValueError("The day of return is already in the past.")
+        if LOA_MAX_DAYS and days > LOA_MAX_DAYS:
+            raise ValueError(f"A Leave of Absence can't be longer than {LOA_MAX_DAYS} days ({days} entered). Check the year.")
+    return days
+
 def parse_leave_period(text, strict=False):
-    # '23/07/2026 27/07/2026' -> (leave_date, return_date, total_days), as datetime.date objects + int.
+    # '23/07/2026 27/07/2026' -> (leave_date, return_date, total_days), as datetime.date objects + int
     # Collect every DD/MM/YYYY in the text. Separators between them (space, '-', 'to', ',') don't matter
     matches = LOA_DATE_REGEX.findall(text)
     if len(matches) != 2:
@@ -3739,19 +3785,8 @@ def parse_leave_period(text, strict=False):
             raise ValueError(f"`{day}/{month}/{year}` isn't a real date.") from None
     leave, ret = dates
 
-    # Order + total days
-    if ret < leave:
-        raise ValueError("The day of return can't be before the day of leave.")
-    days = (ret - leave).days + (1 if LOA_COUNT_INCLUSIVE else 0)
-
-    # Extra checks
-    if strict:
-        if ret < datetime.now(timezone.utc).date():
-            raise ValueError("The day of return is already in the past.")
-        if LOA_MAX_DAYS and days > LOA_MAX_DAYS:
-            raise ValueError(f"A Leave of Absence can't be longer than {LOA_MAX_DAYS} days ({days} entered). Check the year.")
-
-    return leave, ret, days
+    # Order, total days and the extra checks for new submissions
+    return leave, ret, check_leave_dates(leave, ret, strict)
 
 
 def format_leave_period(leave, ret):
@@ -3809,5 +3844,129 @@ def build_loa_note(result):
         f"📁 Filed in {LOA_SHEET_NAME} (row {result['row']})\n"
         f"🗓️ {result['leave']} → {result['return']} • **{result['days']} day{'s' if result['days'] != 1 else ''}**"
     )
+
+
+# ------------------------------------------------------------
+# /loa
+# ------------------------------------------------------------
+@bot.tree.command(name="loa", description="Log a Leave of Absence in the L.O.A. sheet.")
+@app_commands.describe(
+    username="The Roblox username of the member.",
+    date_of_leave=f"Day of leave ({LOA_COMMAND_DATE_HINT}).",
+    date_of_return=f"Day of return ({LOA_COMMAND_DATE_HINT}).",
+    reason="The reason for the Leave of Absence.",
+)
+@require_role()
+async def loa_command(
+    interaction: discord.Interaction,
+    username: str,
+    date_of_leave: str,
+    date_of_return: str,
+    reason: app_commands.Range[str, 1, LOA_REASON_MAX],
+):
+    username, reason = username.strip(), reason.strip()
+    if not username or not reason:
+        await interaction.response.send_message(
+            embed=make_error_embed("Invalid Input", "The username and the reason can't be empty."), ephemeral=True
+        )
+        return
+    try:
+        leave = parse_loa_command_date(date_of_leave, "Date of leave")
+        ret = parse_loa_command_date(date_of_return, "Date of return")
+        days = check_leave_dates(leave, ret, strict=True)   # order, not in the past, max length
+    except ValueError as e:
+        await interaction.response.send_message(embed=make_error_embed("Invalid Dates", str(e)), ephemeral=True)
+        return
+
+    # Busy check
+    if command_lock.locked():
+        await interaction.response.send_message(embed=make_busy_embed(), ephemeral=True)
+        return
+
+    async with command_lock:
+        await interaction.response.defer()
+        try:
+            result = await process_loa(username=username, leave_date=leave, return_date=ret, reason=reason)
+
+            await interaction.followup.send(embed=make_embed(
+                interaction,
+                title=f"📝 Leave of Absence Filed | {result['username']}",
+                color=LOA_COLOR_ADDED,
+                fields=[
+                    ("Username", result["username"], True),
+                    ("Duration", f"**{result['days']} day{'s' if result['days'] != 1 else ''}**", True),
+                    ("Filed In", f"{LOA_SHEET_NAME} (row {result['row']})", True),
+                    ("Leave", f"🛫 {result['leave']}", True),
+                    ("Return", f"🛬 {result['return']}", True),
+                    ("Reason", reason, False),
+                ],
+                verb="Updated",
+            ))
+            print(f"LOA filed for {result['username']} (row {result['row']}) by {interaction.user}.")
+
+        except LOAError as e:
+            await interaction.followup.send(embed=make_error_embed(e.title, e.message))
+        except Exception as e:
+            print(f"Error in loa: {e}")
+            await interaction.followup.send(
+                embed=make_error_embed("Something Went Wrong", "An error occurred while processing the command.")
+            )
+
+
+# ------------------------------------------------------------
+# /removeloa
+# ------------------------------------------------------------
+@bot.tree.command(name="removeloa", description="Remove a member's Leave of Absence from the L.O.A. sheet.")
+@app_commands.describe(username="The Roblox username of the member.")
+@require_role()
+async def remove_loa_command(interaction: discord.Interaction, username: str):
+    username = username.strip()
+    if not username:
+        await interaction.response.send_message(
+            embed=make_error_embed("Invalid Username", "You must provide a Roblox username."), ephemeral=True
+        )
+        return
+
+    # Busy check
+    if command_lock.locked():
+        await interaction.response.send_message(embed=make_busy_embed(), ephemeral=True)
+        return
+
+    async with command_lock:
+        await interaction.response.defer()
+        try:
+            result = await process_remove_loa(username)
+            entries = result["entries"]
+
+            # One line per removed entry
+            lines = [
+                f"**Row {e['row']}** • {e['leave']} → {e['return']}\n└ {e['reason'][:100]}{'…' if len(e['reason']) > 100 else ''}"
+                for e in entries
+            ]
+            fields = [
+                ("Username", result["display_name"], True),
+                ("Entries Removed", str(len(entries)), True),
+                ("Cleared From", LOA_SHEET_NAME, True),
+                ("Removed Data", "\n".join(lines), False),
+            ]
+            if len(entries) > 1:
+                fields.append(("⚠️ Duplicates", f"The member had **{len(entries)}** entries. All of them were cleared.", False))
+
+            await interaction.followup.send(embed=make_embed(
+                interaction,
+                title=f"🗑️ Leave of Absence Removed | {result['display_name']}",
+                color=LOA_COLOR_REMOVED,
+                fields=fields,
+                verb="Updated",
+            ))
+            print(f"Removed {len(entries)} LOA entr{'y' if len(entries) == 1 else 'ies'} of {result['display_name']} by {interaction.user}.")
+
+        except LOAError as e:
+            await interaction.followup.send(embed=make_error_embed(e.title, e.message))
+        except Exception as e:
+            print(f"Error in removeloa: {e}")
+            await interaction.followup.send(
+                embed=make_error_embed("Something Went Wrong", "An error occurred while processing the command.")
+            )
 
 bot.run(DISCORD_BOT_TOKEN)
