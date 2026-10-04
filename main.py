@@ -3091,7 +3091,22 @@ async def accept_and_file(interaction, record):
         await save_requests()
         print(f"{record['id']} accepted by {interaction.user} and filed.")
  
- 
+class DenyReasonModal(discord.ui.Modal, title="Deny Request"):
+    # Pop up shown when a reviewer presses Deny
+    reason = discord.ui.TextInput(
+        label="Denial reason",
+        style=discord.TextStyle.paragraph,
+        placeholder="Why is this request being denied?",
+        required=True,
+        max_length=REQUEST_DENY_REASON_MAX,
+    )
+
+    async def on_submit(self, interaction: discord.Interaction):
+        # Re-check
+        record = await RequestReviewView.authorize(interaction)
+        if record is not None:
+            await finalize_review(interaction, record, "denied", reason=self.reason.value.strip())
+
 class RequestReviewView(discord.ui.View):
     # Manages the persistence of accept/deny buttons
  
@@ -3141,10 +3156,9 @@ class RequestReviewView(discord.ui.View):
  
     @discord.ui.button(label="Deny", emoji="❌", style=discord.ButtonStyle.danger, custom_id="request_review_deny")
     async def deny_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        # Permission is checked BEFORE the pop-up, so unauthorized users never see it.
+        # Permission is checked before popup
         if await self.authorize(interaction) is not None:
             await interaction.response.send_modal(DenyReasonModal())
- 
  
 # ----- Panel view + /requestpanel ----------------------------------------------------
  
