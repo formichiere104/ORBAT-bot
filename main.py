@@ -1,20 +1,5 @@
-# ============================================================
-# HOW THIS FILE IS ORGANIZED
-# ============================================================
-# 1. Imports & gspread setup       -> UNCHANGED, as requested
-# 2. Sheet layout config           -> column numbers, all in one place
-# 3. Embed / style config          -> colors, footer branding
-# 4. Generic helpers                -> sheet I/O, lookups, embeds, bars
-# 5. Permissions                    -> role check + reusable decorator
-# 6. Business logic                 -> promotion & points calculations
-# 7. Bot setup + central error handler
-# 8. COMMAND TEMPLATE (commented)   -> copy this for any new command
-# 9. Commands: test, register, orbat, progress, addpoints, promote
-#
-# The idea: if you ever need to add a new command, steps 2-6 already give
-# you every building block (column constants, lookup helpers, embed
-# builders, the permission decorator). You mostly just write the command
-# body following the template in step 8.
+# ORBAT BOT made by whov2
+# Passion project, working on the connection between a Discord bot and an external public database (hosted in Google Sheets)
 
 # DISCORD PY IMPORTS
 import discord
@@ -27,7 +12,6 @@ from google.oauth2.service_account import Credentials
 from gspread.cell import Cell
 from gspread.utils import a1_to_rowcol, rowcol_to_a1
 from gspread.exceptions import APIError
-
 
 # MISC IMPORTS
 import requests
@@ -54,7 +38,6 @@ def require_env(name: str) -> str:
         )
     return value
 
-
 # GLOBAL STUFF
 ranks = ["Cadet", "Private", "Private First Class", "Specialist", "Lance Corporal", "Corporal", "Sergeant", "Staff Sergeant", "Sergeant Major", "Warrant Officer", "Second Lieutenant", "Lieutenant", "Captain", "Senior Warrant Officer", "Major", "Colonel", "Battalion Commander"]
 CMD_PERMS_ROLES = {1549719657420693514, 1423287377111023679}
@@ -66,7 +49,6 @@ DISCORD_BOT_TOKEN = require_env("DISCORD_BOT_TOKEN")
 APPS_SCRIPT_URL = require_env("APPS_SCRIPT_URL")
 APPS_SCRIPT_SECRET = require_env("APPS_SCRIPT_SECRET")
 BLOXLINK_API_KEY = os.environ.get("BLOXLINK_API_KEY")
-
 
 # ONLY FOR DEVELOPMENT
 GUILD_ID = 1007656642038472754
@@ -86,100 +68,77 @@ sheet_id = require_env("SHEET_ID")
 sh = client.open_by_key(sheet_id)
 sheet = sh.worksheet("Data")
 
-
-# Rank display order for /battalion stats: most senior -> most junior
 DISPLAY_RANK_ORDER = [r for r in reversed(ranks) if r != "Cadet"]
 
-# Roblox group IDs tracked by /bgcheck. Add or remove entries here to track
-# more (or fewer) groups — nothing else in the code needs to change.
+# Roblox group IDs tracked by /bgcheck. Add or remove entries here to track more (or fewer) groups
 ROBLOX_GROUPS = {
     "442nd Battalion": 990610899,
     "GAR": 1092793046,
     "Navy": 964195468,
 }
  
-ROBLOX_API_TIMEOUT = 10  # seconds, per individual Roblox API request
+ROBLOX_API_TIMEOUT = 10 # seconds, per individual Roblox API request
 
 # ============================================================
 # SHEET LAYOUT CONFIG
 # ============================================================
-# Everything here describes WHERE things live in the "Data" sheet. If the
-# sheet layout ever changes (columns added/moved), this is the only place
-# you should need to update — every command reads through these constants
-# instead of hardcoding numbers.
-#
-# NOTE: these are 0-indexed, matching the position of each value inside a
-# row returned by sheet.get_all_values() (e.g. row[COL_USERNAME]).
-# When writing a Cell(), gspread wants a 1-indexed column, so we do
-# `COL_X + 1` at the point of writing.
 
-DATA_START_ROW = 11   # first sheet row (1-indexed) containing a player
-DATA_END_ROW = 978    # last sheet row (1-indexed) reserved for players
+# NOTE: these are 0-indexed
 
-COL_USERNAME    = 3   # D - Roblox username
-COL_RANK        = 4   # E - in-game rank
-COL_DESIGNATION = 5   # F - e.g. CT-5142 "Henry"
-COL_TIMEZONE    = 6   # G - timezone
-COL_POINTS      = 7   # H - TOTAL points (sheet formula = I+J+K, never write to this)
-COL_TRAINING    = 8   # I - Battalion Event (BE) points
-COL_PD          = 9   # J - Permadeath (PD) points
-COL_HOSTED      = 10  # K - Hosted points
-COL_PROMOTION   = 11  # L - promotion checkbox
-COL_LAST_EVENT  = 12  # M - date of last event
-COL_JOINED      = 13  # N - date joined
-COL_RETURN      = 14  # O - return / WIA date
+DATA_START_ROW = 11 # first sheet row (1-indexed) containing a player
+DATA_END_ROW = 978 # last sheet row (1-indexed) reserved for players
 
-# Maps the /addpoints "points_type" choice value to the column it edits.
+COL_USERNAME    = 3 # D - Roblox username
+COL_RANK        = 4 # E - in-game rank
+COL_DESIGNATION = 5 # F - e.g. CT-5142 "Henry"
+COL_TIMEZONE    = 6 # G - timezone
+COL_POINTS      = 7 # H - total points
+COL_TRAINING    = 8 # I - Battalion Event (BE) points
+COL_PD          = 9 # J - Permadeath (PD) points
+COL_HOSTED      = 10 # K - Hosted points
+COL_PROMOTION   = 11 # L - promotion checkbox
+COL_LAST_EVENT  = 12 # M - date of last event
+COL_JOINED      = 13 # N - date joined
+COL_RETURN      = 14 # O - return / WIA date
+
+# Maps the /addpoints "points_type"
 POINTS_TYPE_COLUMNS = {
     "BE": COL_TRAINING,
     "PD": COL_PD,
     "Hosted": COL_HOSTED,
 }
 
-# Promotion thresholds. Only ranks listed here are auto-promotable via BE/PD
-# points; anything else (NCO/Officer tier) is handled manually by
-# leadership. The NEXT rank is looked up dynamically from the `ranks` list
-# above, so you only need to keep one source of truth for rank order.
+# Promotion thresholds. Only ranks listed here are auto-promotable
 POINT_PROMOTION_REQUIREMENTS = {
     "Private":              {"be": 4,  "pd": 2},
     "Private First Class":  {"be": 8,  "pd": 4},
     "Specialist":           {"be": 12, "pd": 8},
 }
 
-# The highest rank whose points are still tracked in the sheet, but which
-# isn't itself auto-promotable — promotion beyond this is a manual
-# leadership decision, not a BE/PD threshold. /progress shows a distinct
-# "sheet ceiling reached" message for this rank instead of the generic
-# NCO/Officer tier one.
+# Hihest rank someone can be promoted to via /promote
 SHEET_CEILING_RANK = "Lance Corporal"
 
-
 # ============================================================
-# EMBED / STYLE CONFIG
+# EMBED STYLE CONFIG
 # ============================================================
-EMBED_COLOR_SUCCESS = 0x57F287  # green  - things went well
-EMBED_COLOR_ERROR   = 0xED4245  # red    - validation / lookup failures
-EMBED_COLOR_GOLD    = 0xF1C40F  # gold   - "not yet", informational
+EMBED_COLOR_SUCCESS = 0x57F287  # green - success
+EMBED_COLOR_ERROR   = 0xED4245  # red - validation / lookup failures
+EMBED_COLOR_GOLD    = 0xF1C40F  # gold - informational
 EMBED_COLOR_INFO    = 0x5865F2  # blurple - neutral default
-EMBED_COLOR_EVENT   = 0x2ECC71  # green  - /event embeds
+EMBED_COLOR_EVENT   = 0x2ECC71  # green - /event embeds
 
 FOOTER_BRAND = "442nd ORBAT System"
 
 # ============================================================
 # EVENT SYSTEM CONFIG  (used by /event)
 # ============================================================
-# Everything /event needs to know about the battalion's companies /
-# detachments lives here. To wire this up for the real server:
 #   1. Replace each "emoji" below with the real custom emote, pasted
 #      straight from Discord (type \:emojiname: in a message and copy the
 #      result, e.g. "<:horn:123456789012345678>"). Plain unicode emoji
-#      (the keycap numbers below) and custom emoji strings both work —
-#      see the _as_emoji() helper further down.
+#      (the keycap numbers below) and custom emoji strings both work
 #   2. Optionally set "logo_url" to a direct image link. It's used as the
-#      default thumbnail on a company-specific event for that unit (only
-#      if the event creator doesn't upload their own thumbnail).
-# Nothing else in the code needs to change — every event command reads
-# through this dict instead of hardcoding company names.
+#      default thumbnail on a company-specific event for that unit
+
 EVENT_TYPE_GENERAL = "general"   # one event for the whole battalion; one reaction emoji per company
 EVENT_TYPE_COMPANY = "company"   # one event for a single company; Accepted/Declined/Tentative buttons
  
@@ -196,17 +155,14 @@ BATTALION_COMPANIES = {
     "guests":            {"label": "Guests",                   "emoji": "9️⃣", "logo_url": None},
 }
  
-EVENT_REMINDER_LEAD_MINUTES     = 20    # how long before start the reminder thread + ping fires
-EVENT_REFRESH_DEBOUNCE_SECONDS  = 1.5   # coalesces a burst of reactions into a single embed edit
-EVENT_RSVP_MUTUALLY_EXCLUSIVE   = True  # company events: can a member only hold ONE of Accepted/Declined/Tentative at a time?
-EVENT_FIELD_CHAR_LIMIT          = 300   # per-category name list cap, keeps embeds under Discord's 6000-char total limit
-EVENT_DESCRIPTION_CHAR_LIMIT    = 500   # same reason
-EVENTS_FILE = "events_data.json"        # where tracked events + RSVP lists persist across bot restarts
+EVENT_REMINDER_LEAD_MINUTES     = 20 # how long before start the reminder thread + ping fires
+EVENT_REFRESH_DEBOUNCE_SECONDS  = 1.5 # coalesces a burst of reactions into a single embed edit
+EVENT_RSVP_MUTUALLY_EXCLUSIVE   = True # company events: can a member only hold one of Accepted/Declined/Tentative at a time?
+EVENT_FIELD_CHAR_LIMIT          = 300 # per-category name list cap, keeps embeds under Discord's 6000-char total limit
+EVENT_DESCRIPTION_CHAR_LIMIT    = 500 # same reason
+EVENTS_FILE = "events_data.json" # where tracked events + RSVP lists persist across bot restarts
  
-# Accepted formats for the start/end time prompts, tried in order. Add or
-# remove strptime patterns here — nothing else needs to change. Times are
-# entered in the user's OWN local time; their UTC offset (asked for in a
-# separate step) is what lets the bot convert it to a real UTC instant.
+# Accepted formats for the start/end time prompts, tried in order. Add or remove strptime patterns here
 DATETIME_FORMATS = [
     "%d/%m/%Y %H:%M",
     "%d-%m-%Y %H:%M",
@@ -219,57 +175,41 @@ DATETIME_FORMAT_EXAMPLES = [
 ]
 
 # ============================================================
-# REQUEST SYSTEM CONFIG  (LOA / Discharge — used by /requestpanel)
+# REQUEST SYSTEM CONFIG
 # ============================================================
-# Everything the request system needs to know lives in this block. To
-# change who can do what, add a company, or reword the panel, you should
-# only ever need to edit THIS block — the code further down reads
-# everything from here.
  
 # --- Who can do what -----------------------------------------------------
-# Roles allowed to run /requestpanel. Add more role IDs to this set any time.
+# Roles allowed to run /requestpanel
 REQUEST_PANEL_ROLE_IDS = {
     1423287377111023679,
 }
  
-# Roles allowed to press Accept / Deny on a posted request. Kept SEPARATE
-# from the company table below so you can add extra reviewers (e.g. Warrant
-# Officers) without touching the companies. Add more role IDs any time.
+# Roles allowed to press Accept / Deny on a posted request
 REQUEST_REVIEWER_ROLE_IDS = {
-    1554139229003452426,  # Company 1 HQ
-    1554139296758505492,  # Company 2 HQ
-    1554139344292421735,  # Company 3 HQ
+    1554139229003452426, # Company 1 HQ
+    1554139296758505492, # Company 2 HQ
+    1554139344292421735, # Company 3 HQ
 }
  
 # --- Companies -------------------------------------------------------------
-# company role ID -> the name shown in the "Company" field + that company's
-# HQ role (pinged on discharge requests). Add one line per company.
-# ⚠️ CHECK THE NAMES: I matched them to your role IDs in the order you gave
-# them (Horn, Doom, Viper) — swap them if that's not the right order.
+# company role ID -> the name shown in the "Company" field + that company's HQ role
 REQUEST_COMPANIES = {
     1554139371647533127: {"name": "Horn Company",  "hq_role_id": 1554139229003452426, "discharge_key": "horn"},
     1554139402488389693: {"name": "Doom Company",  "hq_role_id": 1554139296758505492, "discharge_key": "doom"},
     1554139434318962868: {"name": "Viper Company", "hq_role_id": 1554139344292421735, "discharge_key": "viper"},
 }
-# Shown when the submitter has NO company role, or MORE THAN ONE (no HQ is pinged then).
+# Shown when the submitter has no company role, or more than one (no HQ is pinged then)
 REQUEST_COMPANY_FALLBACK = "N/A"
  
 # --- Request types -----------------------------------------------------------
-# Each entry becomes one panel button, one DM format and one embed layout.
-# "fields" is the form, in order. For each field:
-#   key      internal name (don't change once requests exist in the log)
-#   label    the text before the ":" in the DM format AND the embed field name
-#   hint     the "(State your ...)" help text shown in the DM
-#   inline   True = small column in the embed, False = full-width row
-#   max_len  longest accepted answer (Discord caps embed fields at 1024)
 REQUEST_TYPES = {
     "loa": {
-        "prefix": "LOA",                              # request IDs look like LOA-0001
+        "prefix": "LOA", # request IDs look like LOA-0001
         "short_name": "Leave of Absence",
         "title": "📝 Leave of Absence Request",
-        "channel_id": 1554138318839742505,            # where finished requests are posted
-        "ping_hq": False,                             # ping the submitter's company HQ on post?
-        "pending_color": 0x5865F2,                    # embed color while waiting for review
+        "channel_id": 1554138318839742505, # where finished requests are posted
+        "ping_hq": False, # ping the submitter's company HQ on post?
+        "pending_color": 0x5865F2, # embed color while waiting for review
         "button_label": "Request LOA",
         "button_emoji": "📝",
         "button_style": discord.ButtonStyle.primary,
@@ -280,7 +220,7 @@ REQUEST_TYPES = {
             {"key": "duration", "label": "Duration", "hint": "State the day of leave and the day of return as DD/MM/YYYY DD/MM/YYYY, e.g. 23/07/2026 27/07/2026", "type": "date_range", "inline": False, "max_len": 100},
             {"key": "reason",           "label": "Reason",           "hint": "Your reason",           "inline": False, "max_len": 1000},
         ],
-        "file_on_accept": True,   # True = Accept also writes the request to the sheet (see ACCEPT_FILERS)
+        "file_on_accept": True, # True = Accept also writes the request to the sheet (see ACCEPT_FILERS)
     },
     "discharge": {
         "prefix": "DIS",
@@ -305,13 +245,11 @@ REQUEST_TYPES = {
 }
  
 # --- Behaviour & look ----------------------------------------------------------
-REQUESTS_LOG_FILE = "requests_log.json"       # every filed request + its status, persisted here
-REQUEST_SESSION_TIMEOUT_SECONDS = 30 * 60     # how long the DM format stays open
-REQUEST_DENY_REASON_MAX = 500                 # max length of the denial reason
+REQUESTS_LOG_FILE = "requests_log.json" # every filed request + its status, persisted here
+REQUEST_SESSION_TIMEOUT_SECONDS = 30 * 60 # how long the DM format stays open
+REQUEST_DENY_REASON_MAX = 500 # max length of the denial reason
 REQUEST_FOOTER = "442nd Battalion • Requests" # footer of the DM format embeds
-# True  = the "Discord Username" field is always the submitter's REAL Discord
-#         username (nobody can file a request in someone else's name).
-# False = whatever they typed is used.
+# True = the "Discord Username" field is always the submitter's real Discord username
 REQUEST_FORCE_REAL_DISCORD_USERNAME = True
  
 REQUEST_PENDING_TEXT = "🕓 Pending review"
@@ -320,7 +258,7 @@ REQUEST_STATUS_STYLES = {
     "denied":   {"emoji": "❌", "label": "Denied",   "color": 0x4F545C},
 }
  
-# The three embeds shown on the panel (edit the text freely).
+# The three embeds shown on the panel
 REQUEST_PANEL_EMBEDS = [
     {
         "title": "Discharge and Leave of Absence Requests",
@@ -349,42 +287,33 @@ REQUEST_PANEL_EMBEDS = [
     },
 ]
 
-
 # ============================================================
 # GENERIC HELPERS
 # ============================================================
 
 def safe_int(value, default=0):
-    """Converts a sheet cell to int, tolerating blanks/garbage instead of
-    crashing the whole command on one bad row."""
+    # Converts a sheet cell to int
     try:
         return int(str(value).strip())
     except (TypeError, ValueError):
         return default
 
-
 def get_cell(row, col_index, default=""):
-    """Safely reads row[col_index]. Google Sheets (via gspread) trims
-    trailing empty cells from each row, so a short row is normal, not a
-    bug — this just returns `default` instead of raising IndexError."""
+    # Safely reads row[col_index]
     if col_index < len(row):
         value = row[col_index]
         return value if value != "" else default
     return default
 
-
 def truncate_field(text, limit=1024):
-    """Discord embed field values are capped at 1024 characters. This
-    keeps a huge /addpoints or /promote batch from crashing the send."""
+    # Discord embed field values are capped at 1024 characters
     text = str(text) if text not in (None, "") else "N/A"
     if len(text) <= limit:
         return text
     return text[: limit - 20] + "\n… (truncated)"
 
-
 def parse_username_list(raw: str):
-    """Turns 'user1, user2,user1' into ['user1', 'user2'] — trims
-    whitespace and removes case-insensitive duplicates, preserving order."""
+    # Turns 'user1, user2,user1' into ['user1', 'user2']
     names = []
     for part in raw.split(","):
         name = part.strip()
@@ -394,15 +323,8 @@ def parse_username_list(raw: str):
             names.append(name)
     return names
 
-
 def build_username_index(list_of_lists):
-    """
-    Builds a {lowercase_username: row_index} dict in one pass over the
-    player range, so every command can look up any number of users in O(1)
-    each instead of re-scanning the sheet per user (this replaces the old
-    substring-based `find()` generator, which also risked false-positive
-    matches against other columns).
-    """
+    # Builds a {lowercase_username: row_index}
     index = {}
     start = DATA_START_ROW - 1  # to 0-based
     end = min(DATA_END_ROW, len(list_of_lists))
@@ -412,70 +334,39 @@ def build_username_index(list_of_lists):
             index[username.lower()] = i
     return index
 
-
 def find_first_empty_row(list_of_lists):
-    """Returns the 0-based index of the first row (within the player
-    range) with no username set, for /register. If the sheet's fetched
-    data ends before DATA_END_ROW (Sheets trims trailing empty rows),
-    the first row past what was fetched counts as empty too."""
+    # Returns the 0-based index of the first free row for /register
     start = DATA_START_ROW - 1
     for i in range(start, DATA_END_ROW):
         if i >= len(list_of_lists) or not get_cell(list_of_lists[i], COL_USERNAME):
             return i
-    return None  # sheet is full
-
+    return None # sheet is full
 
 async def get_sheet_data():
-    """
-    The ONE read call every command needs. Runs sheet.get_all_values() in
-    a background thread via asyncio.to_thread — gspread is a blocking/sync
-    library, and calling it directly would freeze the bot's whole event
-    loop (heartbeats, other interactions, etc.) while waiting on Google.
-    """
     return await asyncio.to_thread(sheet.get_all_values)
 
-
 async def update_cells(cells):
-    """
-    The ONE write call every command needs. Flushes every queued Cell in
-    a single batched request (also off the event loop), then clears the
-    shared cell_list so the next command starts fresh.
-    """
     if not cells:
         return
     await asyncio.to_thread(sheet.update_cells, cells)
     cell_list.clear()
 
-
 def make_progress_bar(current, required, length=15):
-    """Cosmetic text progress bar for /progress, e.g. '███████░░░░░░░░ 8/12 (67%)'.
-    Change `length` or the block characters to restyle it."""
+    # Cosmetic text progress bar for /progress
     pct = 100 if required <= 0 else min(100, int((current / required) * 100))
     filled = round(length * pct / 100)
     bar = "█" * filled + "░" * (length - filled)
     return f"{bar} **{current}/{required}** ({pct}%)"
 
-
 def format_requirement_line(current, required, label):
-    """One requirement's full line for /progress: bar + met/not-met status."""
+    # One requirement's full line for /progress: bar + met/not-met status
     bar = make_progress_bar(current, required)
     if current >= required:
         return f"{bar}\n✅ Requirement met"
     return f"{bar}\nStill needed: **{required - current}** {label}"
 
-
 def make_embed(interaction, title, description=None, color=EMBED_COLOR_INFO, fields=None, verb="Requested"):
-    """
-    Standard embed builder used by every command's successful response:
-    consistent title/color/fields, a branded footer ("<brand> • <verb> by
-    <display name>"), the bot's avatar as the footer icon, and a timestamp
-    (Discord renders this as "Today at HH:MM" automatically).
-
-    `fields` is a list of (name, value, inline) tuples.
-    `verb` is "Requested" for read-only commands (/orbat, /progress) or
-    "Updated" for commands that write to the sheet (/addpoints, /promote,
-    /register) — purely cosmetic, tweak freely.
-    """
+    # Standard embed builder
     embed = discord.Embed(title=title, color=color)
     if description:
         embed.description = description
@@ -488,15 +379,12 @@ def make_embed(interaction, title, description=None, color=EMBED_COLOR_INFO, fie
     embed.timestamp = discord.utils.utcnow()
     return embed
 
-
 def make_error_embed(title, description):
-    """Standalone error embed — doesn't need interaction context, so it
-    can be used even before responding/deferring."""
+    # Standalone error embed
     embed = discord.Embed(title=title, description=description, color=EMBED_COLOR_ERROR)
     embed.set_footer(text=FOOTER_BRAND)
     embed.timestamp = discord.utils.utcnow()
     return embed
-
 
 def make_busy_embed():
     return make_error_embed(
@@ -507,11 +395,6 @@ def make_busy_embed():
 # ============================================================
 # ROBLOX API HELPERS  (used by /bgcheck)
 # ============================================================
-# These call Roblox's public REST APIs directly — no auth/API key needed
-# for any of them except the optional Discord-verification lookup. Every
-# helper is written to FAIL SAFE: one flaky/rate-limited endpoint just
-# makes that one field show "Unknown" in the embed, instead of taking down
-# the whole command (same philosophy as safe_int/get_cell above).
 
 class RobloxAPIError(Exception):
     # Raised when Roblox answers with an error (blocked IP, rate limit, outage)
@@ -524,14 +407,13 @@ def _blocking_roblox_request(url, method, json_body, timeout):
     with urllib.request.urlopen(request, timeout=timeout) as response:
         return json.loads(response.read().decode())
 
-
 async def roblox_get_json(session, url, method="GET", json_body=None, strict=False):
     # strict=True  -> raise RobloxAPIError on failure
     # strict=False -> return None, so optional fields just show 'Unknown'
     try:
-        # to_thread keeps the event loop free; the 7 profile calls still run concurrently via asyncio.gather
+        # to_thread keeps the event loop free
         return await asyncio.to_thread(_blocking_roblox_request, url, method, json_body, ROBLOX_API_TIMEOUT)
-    except urllib.error.HTTPError as e: # must come first: HTTPError is a subclass of URLError
+    except urllib.error.HTTPError as e:
         print(f"Roblox API {e.code} for {url}")
     except (urllib.error.URLError, TimeoutError, OSError, ValueError) as e:
         print(f"Roblox API request failed for {url}: {e!r}")
@@ -541,7 +423,6 @@ async def roblox_get_json(session, url, method="GET", json_body=None, strict=Fal
     if strict:
         raise RobloxAPIError("bad HTTP status")
     return None
-
 
 async def roblox_get_user_id(session, username):
     data = await roblox_get_json(
@@ -555,12 +436,8 @@ async def roblox_get_user_id(session, username):
         return None, None
     match = data["data"][0]
     return match["id"], match["name"]
- 
- 
+
 async def roblox_get_group_ranks(session, user_id, group_ids):
-    """Returns {group_id: (role_name, rank_number)} for whichever of
-    `group_ids` the user actually belongs to. A group_id missing from the
-    result just means 'not a member of that group' — handled by the caller."""
     data = await roblox_get_json(session, f"https://groups.roblox.com/v1/users/{user_id}/groups/roles")
     result = {}
     if not data:
@@ -570,8 +447,7 @@ async def roblox_get_group_ranks(session, user_id, group_ids):
         if gid in group_ids:
             result[gid] = (entry["role"]["name"], entry["role"]["rank"])
     return result
- 
- 
+
 async def get_verified_discord_status(session, roblox_user_id):
     if not BLOXLINK_API_KEY:
         return "Not Configured"
@@ -581,10 +457,9 @@ async def get_verified_discord_status(session, roblox_user_id):
         f"https://api.blox.link/v4/public/guilds/{GUILD_ID}/roblox-to-discord/{roblox_user_id}",
     ) # would need an Authorization header with BLOXLINK_API_KEY
     return "Yes" if data and data.get("discordIDs") else "No"
- 
- 
+
 async def fetch_roblox_profile(session, user_id, group_ids):
-    # Fires every profile-detail request CONCURRENTLY via asyncio.gather
+    # Fires every profile-detail request concurrently via asyncio.gather
     details, history, friends_count, followers_count, group_ranks, thumbnail = await asyncio.gather(
         roblox_get_json(session, f"https://users.roblox.com/v1/users/{user_id}"),
         roblox_get_json(session, f"https://users.roblox.com/v1/users/{user_id}/username-history?limit=10&sortOrder=Desc"),
@@ -620,8 +495,7 @@ async def fetch_roblox_profile(session, user_id, group_ids):
         "group_ranks": group_ranks,
         "thumbnail_url": thumbnail_url,
     }
- 
- 
+
 def make_bgcheck_embed(interaction, roblox_id, profile):
     # Builds the /bgcheck embed
     profile_url = f"https://www.roblox.com/users/{roblox_id}/profile"
@@ -659,8 +533,6 @@ def make_bgcheck_embed(interaction, roblox_id, profile):
         embed.set_thumbnail(url=profile["thumbnail_url"])
     return embed
 
-
-
 # ============================================================
 # PERMISSIONS
 # ============================================================
@@ -671,33 +543,17 @@ def has_allowed_role(interaction: discord.Interaction) -> bool:
         return False  # e.g. used in DMs, where roles don't apply
     return any(role.id in CMD_PERMS_ROLES for role in member.roles)
 
-
 def require_role():
-    """
-    Reusable permission gate. Add `@require_role()` right under
-    `@bot.tree.command(...)` on any command that should be restricted to
-    CMD_PERMS_ROLES. Failures are caught centrally by
-    on_app_command_error below, so nothing else is needed in the command
-    body — leave this decorator off for a command anyone can use (like
-    /orbat and /progress).
-    """
+    # Reusable permission gate. Add @require_role() right under @bot.tree.command(...) on any command that should be restricted to CMD_PERMS_ROLES
     async def predicate(interaction: discord.Interaction) -> bool:
         return has_allowed_role(interaction)
     return app_commands.check(predicate)
-
 
 # ============================================================
 # BUSINESS LOGIC
 # ============================================================
 
 def get_promotion_status(row):
-    """
-    Pure, side-effect-free evaluation of a single row's promotion
-    eligibility. Used by BOTH /progress (read-only display) and /promote
-    (which additionally queues the sheet writes if eligible) — keeping
-    the eligibility math in one place avoids the two commands drifting
-    out of sync.
-    """
     current_rank = get_cell(row, COL_RANK)
     requirement = POINT_PROMOTION_REQUIREMENTS.get(current_rank)
     be = safe_int(get_cell(row, COL_TRAINING, "0"))
@@ -720,15 +576,7 @@ def get_promotion_status(row):
         "eligible": be >= requirement["be"] and pd >= requirement["pd"],
     }
 
-
-
 def apply_points(list_of_lists, username_index, usernames, amount, column):
-    """
-    Queues +amount Cell updates for `column` for every matched username.
-    Returns (updated, not_found):
-      updated   -> list of (display_name, old_value, new_value)
-      not_found -> list of usernames with no matching row
-    """
     updated, not_found = [], []
     for name in usernames:
         row_idx = username_index.get(name.lower())
@@ -744,13 +592,7 @@ def apply_points(list_of_lists, username_index, usernames, amount, column):
         updated.append((display_name, current, new_value))
     return updated, not_found
 
-
 def apply_promotions(list_of_lists, username_index, usernames):
-    """
-    Evaluates every username with get_promotion_status() and queues the
-    rank-change + BE-reset Cells for anyone eligible. Returns a dict
-    bucketed by outcome, ready to drop straight into embed fields.
-    """
     result = {"promoted": [], "not_eligible": [], "not_trackable": [], "not_found": []}
 
     for name in usernames:
@@ -776,10 +618,8 @@ def apply_promotions(list_of_lists, username_index, usernames):
 
     return result
 
-
 def sort_users():
-    """Triggers the Apps Script that re-sorts the sheet by rank. Only
-    called after a promotion actually changes someone's rank."""
+    # Triggers the Apps Script that sorts the Data sheet by rank
     response = requests.post(
         APPS_SCRIPT_URL,
         json={"token": APPS_SCRIPT_SECRET},
@@ -797,34 +637,21 @@ def sort_users():
 
     print("Users sorted correctly.")
 
-
 # ============================================================
 # DISCORD BOT SETUP
 # ============================================================
 intents = discord.Intents.default()
 intents.message_content = True
 
-
 class MyBot(commands.Bot):
     def __init__(self):
         super().__init__(command_prefix="!", intents=intents)
-        self.http_session = None  # created below in setup_hook, closed in close()
+        self.http_session = None
 
     async def setup_hook(self):
-
-        # One shared aiohttp session, reused across every /bgcheck call
-        # instead of opening a fresh connection per request — aiohttp pools
-        # and keeps-alive connections under the hood, so this alone
-        # meaningfully cuts down Roblox API latency on repeat lookups.
         self.http_session = aiohttp.ClientSession()
 
-
-        # Reload any /event events that were still active before the last
-        # restart (their RSVP lists and all), and re-register the
-        # persistent RSVP button view so company-event buttons keep
-        # working without the message needing to be resent. Must happen
-        # before tree.sync() so commands and components come up together.
-
+        # Reload any /event events that were still active before a restart
         global active_events
         active_events = load_events()
         self.add_view(EventRSVPView())
@@ -832,49 +659,42 @@ class MyBot(commands.Bot):
             schedule_event_reminder(event)
         print(f"Loaded {len(active_events)} tracked event(s) from disk.")
 
-        # Same idea for the LOA/Discharge request system: reload the log so
-        # numbering + history survive a restart, and re-register its two
-        # persistent views (panel buttons + Accept/Deny) so they keep
-        # working on already-posted messages without being resent.
+        # Reload LOA/discharge system after restart
         load_requests()
         self.add_view(RequestPanelView())
         self.add_view(RequestReviewView())
         print(f"Loaded {len(request_log)} logged request(s) from disk.")
-
-
 
         guild = discord.Object(id=GUILD_ID)
         self.tree.copy_global_to(guild=guild)
         await self.tree.sync(guild=guild)
         print("Slash commands synced to guild.")
 
-        # USA QUESTO QUANDO LO VUOI AGGIUNGERE AD ALTRI SERVER
+        # (Use this if added to multiple servers)
         # await self.tree.sync()
         # print("Slash commands synced.")
 
     async def close(self):
-        # Make sure the aiohttp session's connections are torn down
-        # cleanly on shutdown instead of leaking sockets.
         if self.http_session:
             await self.http_session.close()
         await super().close()
 
-
 bot = MyBot()
-
 
 @bot.event
 async def on_ready():
+    await bot.change_presence(
+        status=discord.Status.online,
+        activity=discord.CustomActivity(
+            name='Dealing with Separatists',
+            emoji='👽',
+        )
+    )
     print(f"Logged on as {bot.user}.")
-
 
 @bot.tree.error
 async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
-    """
-    Central error handler for every slash command. A `@require_role()`
-    failure lands here automatically as CheckFailure — this is what lets
-    every command skip writing its own "you don't have permission" logic.
-    """
+    # Central error handler for every slash command
     if isinstance(error, app_commands.CheckFailure):
         embed = make_error_embed("Permission Denied", "You do not have permission to use this command.")
     else:
@@ -886,60 +706,6 @@ async def on_app_command_error(interaction: discord.Interaction, error: app_comm
     else:
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
-
-# ============================================================
-# COMMAND TEMPLATE — copy this pattern for any new command
-# ============================================================
-# @bot.tree.command(name="template", description="What this command does.")
-# @app_commands.describe(some_field="Explain this parameter to the user.")
-# @require_role()                       # remove this line for a public/read-only command
-# async def template(interaction: discord.Interaction, some_field: str):
-#
-#     # 1) VALIDATE input synchronously, before touching the network or the
-#     #    lock. Bad input should never cost an API call.
-#     some_field = some_field.strip()
-#     if not some_field:
-#         await interaction.response.send_message(
-#             embed=make_error_embed("Invalid Input", "Explain what's wrong."),
-#             ephemeral=True,
-#         )
-#         return
-#
-#     # 2) If this command WRITES to the sheet, reject immediately when the
-#     #    bot is already mid-command instead of silently queueing up —
-#     #    this is what guarantees one command fully finishes before the
-#     #    next one can touch the sheet. Read-only commands can skip this.
-#     if command_lock.locked():
-#         await interaction.response.send_message(embed=make_busy_embed(), ephemeral=True)
-#         return
-#
-#     # 3) Do the actual work under the lock.
-#     async with command_lock:
-#         await interaction.response.defer()  # Sheets calls can take > 3s
-#         try:
-#             list_of_lists = await get_sheet_data()
-#             username_index = build_username_index(list_of_lists)
-#
-#             # ... business logic here, queueing Cell(...) into cell_list ...
-#
-#             if cell_list:
-#                 await update_cells(cell_list)
-#
-#             embed = make_embed(
-#                 interaction,
-#                 title="Template Result",
-#                 color=EMBED_COLOR_SUCCESS,
-#                 fields=[("Field Name", "Field Value", True)],
-#                 verb="Updated",
-#             )
-#             await interaction.followup.send(embed=embed)
-#         except Exception as e:
-#             print(f"Error in template: {e}")
-#             await interaction.followup.send(
-#                 embed=make_error_embed("Something Went Wrong", "An error occurred while processing the command.")
-#             )
-
-
 # ============================================================
 # COMMANDS
 # ============================================================
@@ -947,9 +713,8 @@ async def on_app_command_error(interaction: discord.Interaction, error: app_comm
 @bot.tree.command(name="test", description="Test command.")
 async def test(interaction: discord.Interaction):
     await interaction.response.send_message(
-        embed=make_embed(interaction, title="It works!", color=EMBED_COLOR_SUCCESS)
+        embed=make_embed(interaction, title="Five more minutes please- 😴", color=EMBED_COLOR_SUCCESS)
     )
-
 
 # ------------------------------------------------------------
 # /register
@@ -969,7 +734,7 @@ async def register(
     nickname: str,
     timezone: str,
 ):
-    # 1) Validate
+
     roblox_username = roblox_username.strip()
     ct_number = ct_number.strip()
     nickname = nickname.strip()
@@ -997,12 +762,12 @@ async def register(
         )
         return
 
-    # 2) Busy check
+    # Busy check
     if command_lock.locked():
         await interaction.response.send_message(embed=make_busy_embed(), ephemeral=True)
         return
 
-    # 3) Work
+    # Logic
     async with command_lock:
         await interaction.response.defer()
         try:
@@ -1026,7 +791,8 @@ async def register(
 
             designation = f'CT-{ct_number} "{nickname}"'
             join_date = datetime.now().strftime("%d/%m/%Y")
-            row_number = empty_row + 1  # back to 1-indexed for gspread
+            # 1-indexed for gspread
+            row_number = empty_row + 1
 
             cell_list.append(Cell(row=row_number, col=COL_USERNAME + 1, value=roblox_username))
             cell_list.append(Cell(row=row_number, col=COL_RANK + 1, value="Private"))
@@ -1062,9 +828,8 @@ async def register(
                 embed=make_error_embed("Something Went Wrong", "An error occurred while processing the command.")
             )
 
-
 # ------------------------------------------------------------
-# /orbat  (read-only, open to everyone)
+# /orbat
 # ------------------------------------------------------------
 @bot.tree.command(name="orbat", description="Display a member's ORBAT record.")
 @app_commands.describe(roblox_username="The Roblox username to look up.")
@@ -1076,7 +841,6 @@ async def orbat(interaction: discord.Interaction, roblox_username: str):
         )
         return
 
-    # Read-only: no lock needed, just defer since the Sheets call can be slow.
     await interaction.response.defer()
     try:
         list_of_lists = await get_sheet_data()
@@ -1118,9 +882,8 @@ async def orbat(interaction: discord.Interaction, roblox_username: str):
             embed=make_error_embed("Something Went Wrong", "An error occurred while processing the command.")
         )
 
-
 # ------------------------------------------------------------
-# /progress  (read-only, open to everyone)
+# /progress
 # ------------------------------------------------------------
 @bot.tree.command(name="progress", description="Display a member's promotion progress toward their next rank.")
 @app_commands.describe(username="The username to check.")
@@ -1151,8 +914,7 @@ async def progress(interaction: discord.Interaction, username: str):
         status = get_promotion_status(row)
  
         if not status["trackable"] and status["rank"] == SHEET_CEILING_RANK:
-            # Lance Corporal: points are still tracked, but there's no BE/PD
-            # threshold to promote past it — it's a manual leadership call.
+            # Lance Corporal is the max rank achievable by accumulating points
             embed = make_embed(
                 interaction,
                 title=f"Promotion Progress | {display_name}",
@@ -1226,8 +988,6 @@ async def progress(interaction: discord.Interaction, username: str):
             embed=make_error_embed("Something Went Wrong", "An error occurred while processing the command.")
         )
 
-
-
 # ------------------------------------------------------------
 # /addpoints
 # ------------------------------------------------------------
@@ -1251,7 +1011,7 @@ async def addpoints(
     usernames: str,
     points_amount: app_commands.Range[int, 1, 100000],
 ):
-    # 1) Validate
+
     names_list = parse_username_list(usernames)
     if not names_list:
         await interaction.response.send_message(
@@ -1259,19 +1019,19 @@ async def addpoints(
             ephemeral=True,
         )
         return
-    if points_amount <= 0:  # belt-and-suspenders alongside the Range[] constraint above
+    if points_amount <= 0:
         await interaction.response.send_message(
             embed=make_error_embed("Invalid Points Amount", "Points amount must be greater than 0."),
             ephemeral=True,
         )
         return
 
-    # 2) Busy check
+    # Busy check
     if command_lock.locked():
         await interaction.response.send_message(embed=make_busy_embed(), ephemeral=True)
         return
 
-    # 3) Work
+    # Logic logic
     async with command_lock:
         await interaction.response.defer()
         try:
@@ -1306,7 +1066,6 @@ async def addpoints(
                 embed=make_error_embed("Something Went Wrong", "An error occurred while processing the command.")
             )
 
-
 # ------------------------------------------------------------
 # /promote
 # ------------------------------------------------------------
@@ -1314,7 +1073,7 @@ async def addpoints(
 @app_commands.describe(usernames="Username or usernames separated by commas.")
 @require_role()
 async def promote(interaction: discord.Interaction, usernames: str):
-    # 1) Validate
+
     names_list = parse_username_list(usernames)
     if not names_list:
         await interaction.response.send_message(
@@ -1323,12 +1082,12 @@ async def promote(interaction: discord.Interaction, usernames: str):
         )
         return
 
-    # 2) Busy check
+    # Busy check
     if command_lock.locked():
         await interaction.response.send_message(embed=make_busy_embed(), ephemeral=True)
         return
 
-    # 3) Work
+    # Logic
     async with command_lock:
         await interaction.response.defer()
         try:
@@ -1380,27 +1139,19 @@ async def promote(interaction: discord.Interaction, usernames: str):
             )
 
 # ------------------------------------------------------------
-# /battalion stats   (read-only, open to everyone)
+# /battalion stats
 # ------------------------------------------------------------
-# Implemented as a command GROUP (name="battalion") rather than a flat
-# command so it shows up as "/battalion stats" in Discord, matching the
-# reference screenshot — and so any future battalion-wide info command
-# (e.g. a hypothetical "/battalion roster") can be added as another
-# subcommand here without cluttering the top-level command list.
 battalion_group = app_commands.Group(name="battalion", description="Battalion-wide info commands.")
- 
- 
+
 @battalion_group.command(name="stats", description="Display battalion-wide statistics.")
 async def battalion_stats(interaction: discord.Interaction):
-    # Read-only, single sheet read, no lock needed — safe to run alongside
-    # /addpoints, /promote, etc.
     await interaction.response.defer()
     try:
         list_of_lists = await get_sheet_data()
         start = DATA_START_ROW - 1
         end = min(DATA_END_ROW, len(list_of_lists))
  
-        rank_counts = {rank: 0 for rank in DISPLAY_RANK_ORDER}  # preserves DISPLAY_RANK_ORDER's order
+        rank_counts = {rank: 0 for rank in DISPLAY_RANK_ORDER}
         total_members = 0
         pending_promotion = 0
         total_be = total_pd = total_hosted = 0
@@ -1408,35 +1159,23 @@ async def battalion_stats(interaction: discord.Interaction):
         for i in range(start, end):
             row = list_of_lists[i]
             if not get_cell(row, COL_USERNAME):
-                continue  # empty row = no player here
+                continue
  
             total_members += 1
             rank = get_cell(row, COL_RANK)
             if rank in rank_counts:
                 rank_counts[rank] += 1
-            # Cadets are counted in total_members but excluded from the
-            # breakdown (rank_counts only has DISPLAY_RANK_ORDER's ranks),
-            # per the spec.
  
             total_be += safe_int(get_cell(row, COL_TRAINING, "0"))
             total_pd += safe_int(get_cell(row, COL_PD, "0"))
             total_hosted += safe_int(get_cell(row, COL_HOSTED, "0"))
  
-            # Reuses the exact same eligibility logic /progress and /promote
-            # use, so this number can never drift out of sync with them.
             status = get_promotion_status(row)
             if status["trackable"] and status["eligible"]:
                 pending_promotion += 1
  
         breakdown_text = "\n".join(f"**{rank}**: {count}" for rank, count in rank_counts.items())
  
-        # Two additions beyond the reference screenshot, both computed for
-        # free from data already being read for the rank breakdown:
-        #   - "Pending Promotions": how many members are eligible RIGHT NOW
-        #     but haven't been run through /promote yet — useful at-a-glance
-        #     for leadership to know if /promote needs to be run.
-        #   - "Points Tracked": total BE/PD/Hosted across the whole
-        #     battalion — a rough gauge of overall event participation.
         fields = [
             ("Total Members", str(total_members), True),
             ("Pending Promotions", str(pending_promotion), True),
@@ -1458,27 +1197,23 @@ async def battalion_stats(interaction: discord.Interaction):
         await interaction.followup.send(
             embed=make_error_embed("Something Went Wrong", "An error occurred while processing the command.")
         )
- 
- 
+
 bot.tree.add_command(battalion_group)
- 
- 
+
 # ------------------------------------------------------------
 # /bgcheck
 # ------------------------------------------------------------
 @bot.tree.command(name="bgcheck", description="Run a background check on a Roblox user.")
 @app_commands.describe(roblox_username="The Roblox username to look up.")
 async def bgcheck(interaction: discord.Interaction, roblox_username: str):
-    # 1) Validate
+
     roblox_username = roblox_username.strip()
     if not roblox_username:
         await interaction.response.send_message(
             embed=make_error_embed("Invalid Username", "You must provide a Roblox username."), ephemeral=True
         )
         return
- 
-    # Read-only and doesn't touch the sheet at all (Roblox API only), so no
-    # command_lock needed — this can safely run alongside /addpoints, etc.
+
     await interaction.response.defer()
     try:
         roblox_id, canonical_name = await roblox_get_user_id(bot.http_session, roblox_username)
@@ -1507,18 +1242,13 @@ async def bgcheck(interaction: discord.Interaction, roblox_username: str):
         await interaction.followup.send(
             embed=make_error_embed("Something Went Wrong", "An error occurred while processing the command.")
         )
- 
- 
+
 # ------------------------------------------------------------
-# /req   (read-only, open to everyone, no sheet or API calls at all)
+# /req
 # ------------------------------------------------------------
 @bot.tree.command(name="req", description="Display promotion point requirements for every rank.")
 async def req(interaction: discord.Interaction):
     try:
-        # Pulled straight from POINT_PROMOTION_REQUIREMENTS + ranks, so this
-        # can never drift out of sync with what /progress and /promote
-        # actually enforce — change the numbers in ONE place (the config
-        # section near the top of the file) and every command updates together.
         lines = ["**Private**\n└ Graduate from the Cadet Academy\n"]
         for rank, requirement in POINT_PROMOTION_REQUIREMENTS.items():
             try:
@@ -1545,43 +1275,20 @@ async def req(interaction: discord.Interaction):
         )
 
 # ============================================================
-# EVENT SYSTEM  (/event)
+# EVENT SYSTEM
 # ============================================================
-# Everything below builds the /event command: a DM-driven setup wizard
-# that ends with an embed posted in a channel, which people then RSVP to
-# either with reactions (general events, one emoji per company) or
-# buttons (company events: Accepted / Declined / Tentative). Config for
-# this lives in EVENT SYSTEM CONFIG near the top of the file.
-#
-# Layout of this section:
-#   A. In-memory state + JSON persistence (survives bot restarts)
-#   B. Small utilities (emoji handling, sentinels)
-#   C. Input validators (title, description, UTC offset, date/time, URL, channel)
-#   D. DM wizard views (buttons/selects) + the generic text-prompt helper
-#   E. Embed builder (shared by the preview AND the live posted embed)
-#   F. Posting a confirmed event + the wizard orchestrator
-#   G. The /event command itself
-#   H. Persistent RSVP button view (company events)
-#   I. Reaction handling (general events)
-#   J. 20-minutes-out reminder thread + ping
- 
- 
-# ----- A. State + persistence --------------------------------------------
- 
+
 active_events = {}      # {message_id: event_dict} — the live source of truth, mirrored to disk on every change
 reminder_tasks = {}     # {message_id: asyncio.Task} — the scheduled 20-min-out reminder for each event
 active_setups = set()   # user_ids currently mid-wizard in their DMs, so a second /event can't collide with it
 _pending_refresh_tasks = {}  # {message_id: asyncio.Task} — debounces reaction bursts (see request_event_refresh)
- 
- 
+
 def _write_events_file(data):
     with open(EVENTS_FILE, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2)
- 
- 
+
 async def save_events():
-    """Persists active_events to disk (in a background thread, since file
-    I/O is blocking) so events and their RSVP lists survive a restart."""
+    # Persists active_events to disk
     try:
         data = {str(message_id): ev for message_id, ev in active_events.items()}
         await asyncio.to_thread(_write_events_file, data)
@@ -1590,8 +1297,7 @@ async def save_events():
  
  
 def load_events():
-    """Loads persisted events back into memory at startup. A missing or
-    corrupt file just means 'no events yet', not a crash."""
+    # Loads persisted events back into memory at startup
     if not os.path.exists(EVENTS_FILE):
         return {}
     try:
@@ -1601,35 +1307,24 @@ def load_events():
     except (json.JSONDecodeError, ValueError, OSError) as e:
         print(f"Could not load {EVENTS_FILE}, starting with no tracked events: {e}")
         return {}
- 
- 
-# ----- B. Small utilities --------------------------------------------------
- 
-EVENT_CANCELLED = object()  # sentinel: user typed "cancel" during a text prompt
-EVENT_SKIPPED = object()    # sentinel: user typed "skip" on an optional text prompt
- 
- 
+
+# ----- utilities --------------------------------------------------
+
+EVENT_CANCELLED = object()
+EVENT_SKIPPED = object()
+
 class EventSetupCancelled(Exception):
-    """Raised internally the moment the /event wizard should stop (Cancel
-    pressed, 'cancel' typed, or a step timed out) — caught once at the top
-    of run_event_setup so every step below can just `raise` and let the
-    outer handler send the one cancellation/timeout message, instead of
-    each step repeating its own return-and-cleanup logic."""
+    # Cancel pressed
     pass
- 
- 
+
 def _as_emoji(emoji_str):
-    """Accepts either a plain unicode emoji or a custom emoji string like
-    '<:name:id>' / '<a:name:id>' (paste it straight from Discord) and
-    returns whatever discord.py's add_reaction()/SelectOption() expect."""
+    # Accepts either a plain unicode emoji or a custom emoji string like '<:name:id>' / '<a:name:id>'
     if emoji_str.startswith("<"):
         return discord.PartialEmoji.from_str(emoji_str)
     return emoji_str
  
  
-# ----- C. Input validators --------------------------------------------------
-# Each validator takes the raw text the user typed and returns
-# (True, parsed_value) on success or (False, error_message) to re-prompt.
+# ----- Input --------------------------------------------------
  
 def validate_title(text):
     if not text:
@@ -1637,17 +1332,14 @@ def validate_title(text):
     if len(text) > 100:
         return False, f"Titles must be 100 characters or fewer (yours is {len(text)})."
     return True, text
- 
- 
+
 def validate_description(text):
     if len(text) > EVENT_DESCRIPTION_CHAR_LIMIT:
         return False, f"Descriptions must be {EVENT_DESCRIPTION_CHAR_LIMIT} characters or fewer (yours is {len(text)})."
     return True, text
- 
- 
+
 UTC_OFFSET_PATTERN = re.compile(r"^(?:UTC|GMT)?\s*([+-]?\d{1,2})(?::?(\d{2}))?$", re.IGNORECASE)
- 
- 
+
 def validate_utc_offset(text):
     text = text.strip()
     if text.upper() in ("UTC", "GMT"):
@@ -1661,8 +1353,7 @@ def validate_utc_offset(text):
     if not -14 <= offset <= 14:
         return False, "That offset is out of range — it must be between -14 and +14."
     return True, offset
- 
- 
+
 def validate_datetime(text, utc_offset, after_epoch=None):
     text = text.strip()
     parsed = None
@@ -1674,12 +1365,7 @@ def validate_datetime(text, utc_offset, after_epoch=None):
             continue
     if parsed is None:
         return False, "I couldn't read that date/time. Use one of the formats shown above."
- 
-    # The user typed a LOCAL time at their given UTC offset. Treating the
-    # naive value as if it were already UTC and then subtracting the
-    # offset converts it into a true UTC instant, so the <t:...> timestamp
-    # Discord renders is correct for every viewer regardless of their own
-    # timezone.
+
     utc_dt = parsed.replace(tzinfo=timezone.utc) - timedelta(hours=utc_offset)
     epoch = int(utc_dt.timestamp())
     now_epoch = int(datetime.now(timezone.utc).timestamp())
@@ -1689,22 +1375,16 @@ def validate_datetime(text, utc_offset, after_epoch=None):
     if after_epoch is not None and epoch <= after_epoch:
         return False, "The end time must be after the start time."
     return True, epoch
- 
- 
+
 URL_PATTERN = re.compile(r"^https?://\S+\.\S+$", re.IGNORECASE)
- 
- 
+
 def validate_url(text):
     text = text.strip()
     if not URL_PATTERN.match(text):
         return False, "That doesn't look like a valid URL — it should start with `http://` or `https://`."
     return True, text
- 
- 
+
 def resolve_channel(guild, text, needs_reactions):
-    """Resolves free text (a mention, an ID, or a name) to a postable
-    TextChannel in this guild, and checks the bot actually has the
-    permissions the event type will need there."""
     text = text.strip()
     channel = None
  
@@ -1734,19 +1414,15 @@ def resolve_channel(guild, text, needs_reactions):
     return True, channel
  
  
-# ----- D. DM wizard views + generic text-prompt helper ---------------------
+# ----- DM wizard ---------------------
  
 class EventCancelView(discord.ui.View):
-    """Shared base for every view used in the /event wizard. Restricts
-    interaction to whoever is actually running the wizard and gives every
-    step a consistent Cancel button + timeout behavior, instead of
-    repeating both bits of logic in every subclass."""
  
     def __init__(self, author_id, timeout=300):
         super().__init__(timeout=timeout)
         self.author_id = author_id
-        self.value = None      # set by whichever button/select the user picks
-        self.message = None    # set by send_view() right after sending
+        self.value = None
+        self.message = None
  
     async def interaction_check(self, interaction):
         if interaction.user.id != self.author_id:
@@ -1761,7 +1437,7 @@ class EventCancelView(discord.ui.View):
             try:
                 await self.message.edit(view=self)
             except discord.HTTPException:
-                pass  # message may have been deleted — nothing to do
+                pass
  
     async def _finish(self, interaction, value):
         self.value = value
@@ -1776,18 +1452,13 @@ class EventCancelView(discord.ui.View):
  
  
 async def send_view(dm_channel, content, view):
-    """Sends a message carrying one of the wizard's views and remembers
-    the resulting Message on the view (so on_timeout can grey the buttons
-    out in place instead of leaving dead controls sitting there)."""
     message = await dm_channel.send(content, view=view)
     view.message = message
     return message
  
  
 async def require_view_value(view, dm_channel):
-    """Waits for the view to be used, then either returns the chosen
-    value or raises EventSetupCancelled (after sending the reason) if the
-    user hit Cancel or the view timed out."""
+    # Waits for the view to be used
     await view.wait()
     if view.value == "cancel":
         await dm_channel.send(embed=make_error_embed("Event Creation Cancelled", "No event was created."))
@@ -1801,11 +1472,6 @@ async def require_view_value(view, dm_channel):
  
  
 async def prompt_for_text(dm_channel, author_id, prompt_text, *, validator, allow_skip=False, timeout=300):
-    """Sends `prompt_text` in the DM and waits for the next message from
-    `author_id`, re-prompting on invalid input (via `validator`) until it
-    succeeds. Raises EventSetupCancelled on 'cancel' or a timeout; returns
-    EVENT_SKIPPED if `allow_skip` and the user types 'skip'."""
- 
     def check(m):
         return m.author.id == author_id and m.channel.id == dm_channel.id
  
@@ -1887,12 +1553,10 @@ class ConfirmView(EventCancelView):
         await self._finish(interaction, "confirm")
  
  
-# ----- E. Embed builder -----------------------------------------------------
+# ----- Embed builder -----------------------------------------------------
  
 def build_event_embed(event):
-    """Builds the event embed from an event dict — used for BOTH the DM
-    preview and the live posted message (edited in place as people
-    RSVP), so the two can never drift apart."""
+    # Builds the event embed from an event dict
     embed = discord.Embed(
         title=event["title"],
         description=truncate_field(event["description"], limit=EVENT_DESCRIPTION_CHAR_LIMIT) if event.get("description") else None,
@@ -1944,12 +1608,10 @@ def build_event_embed(event):
     return embed
  
  
-# ----- F. Posting a confirmed event + the wizard orchestrator --------------
+# ----- Event posting --------------
  
 async def post_event(dm_channel, guild, target_channel, event):
-    """Posts the finished event embed to its target channel, wires up
-    reactions (general) or the persistent RSVP view (company), starts
-    tracking it in memory + on disk, and schedules its reminder."""
+    # Posts the finished event embed to its target channel, logs it, and starts tracking
     perms = target_channel.permissions_for(guild.me)
     missing = []
     if not perms.send_messages:
@@ -1959,7 +1621,7 @@ async def post_event(dm_channel, guild, target_channel, event):
     if event["type"] == EVENT_TYPE_GENERAL and not perms.add_reactions:
         missing.append("Add Reactions")
     if not perms.create_public_threads:
-        missing.append("Create Public Threads")  # needed later, for the 20-minute reminder thread
+        missing.append("Create Public Threads")
     if missing:
         await dm_channel.send(embed=make_error_embed(
             "Missing Permissions",
@@ -1985,9 +1647,6 @@ async def post_event(dm_channel, guild, target_channel, event):
             try:
                 await message.add_reaction(_as_emoji(info["emoji"]))
             except discord.HTTPException as e:
-                # One bad/duplicate emoji shouldn't take the whole event down —
-                # the rest still get added; fix the emoji in BATTALION_COMPANIES
-                # and re-add it manually if this happens.
                 print(f"Could not add reaction {info['emoji']} to event {message.id}: {e}")
  
     await save_events()
@@ -2003,25 +1662,21 @@ async def post_event(dm_channel, guild, target_channel, event):
  
  
 async def run_event_setup(user, guild, origin_channel, dm_channel):
-    """Runs the full multi-step /event wizard entirely inside the user's
-    DMs. Every step can be abandoned early — Cancel button, typing
-    'cancel', or simply not responding (timeout) — and all three paths
-    raise EventSetupCancelled, caught once here so the wizard always
-    stops cleanly with no half-created event left behind."""
+    # Runs the /event wizard in the user's DMs
     try:
-        # 1) General or company-specific event?
+        # Company or general event
         type_view = EventTypeView(author_id=user.id)
         await send_view(dm_channel, "**What kind of event is this?**", type_view)
         event_type = await require_view_value(type_view, dm_channel)
  
-        # 2) If company-specific, which company?
+        # Which company
         company_key = None
         if event_type == EVENT_TYPE_COMPANY:
             company_view = CompanySelectView(author_id=user.id)
             await send_view(dm_channel, "**Which company is this event for?**", company_view)
             company_key = await require_view_value(company_view, dm_channel)
  
-        # 3) Which channel should it be posted in?
+        # Which channel
         channel_view = ChannelChoiceView(author_id=user.id, origin_channel=origin_channel)
         await send_view(dm_channel, "**Where should this event be posted?**", channel_view)
         channel_choice = await require_view_value(channel_view, dm_channel)
@@ -2035,22 +1690,22 @@ async def run_event_setup(user, guild, origin_channel, dm_channel):
                 validator=lambda text: resolve_channel(guild, text, needs_reactions=(event_type == EVENT_TYPE_GENERAL)),
             )
  
-        # 4) Title (mandatory, max 100 chars)
+        # Title
         title = await prompt_for_text(dm_channel, user.id, "**Event title?** (max 100 characters)", validator=validate_title)
  
-        # 5) Description (optional)
+        # Description
         description = await prompt_for_text(dm_channel, user.id, "**Event description?**", validator=validate_description, allow_skip=True)
         if description is EVENT_SKIPPED:
             description = None
  
-        # 6) UTC offset (mandatory — needed to interpret the times below)
+        # UTC offset
         offset = await prompt_for_text(
             dm_channel, user.id,
             "**What's your UTC offset?** (e.g. `+2`, `-5`, `+5:30`, `UTC`)",
             validator=validate_utc_offset,
         )
  
-        # 7) Start time (mandatory)
+        # Start time
         format_list = "\n".join(f"• `{ex}`" for ex in DATETIME_FORMAT_EXAMPLES)
         start_epoch = await prompt_for_text(
             dm_channel, user.id,
@@ -2058,7 +1713,7 @@ async def run_event_setup(user, guild, origin_channel, dm_channel):
             validator=lambda text: validate_datetime(text, offset),
         )
  
-        # 8) End time (optional, must be after the start time)
+        # End time
         end_epoch = await prompt_for_text(
             dm_channel, user.id,
             f"**When does it end?** (same format, optional)\n{format_list}",
@@ -2068,7 +1723,7 @@ async def run_event_setup(user, guild, origin_channel, dm_channel):
         if end_epoch is EVENT_SKIPPED:
             end_epoch = None
  
-        # 9) Banner image (optional — large image at the bottom of the embed)
+        # Banner image
         banner_url = await prompt_for_text(
             dm_channel, user.id, "**Banner image URL?** (large image, shown at the bottom — optional)",
             validator=validate_url, allow_skip=True,
@@ -2076,7 +1731,7 @@ async def run_event_setup(user, guild, origin_channel, dm_channel):
         if banner_url is EVENT_SKIPPED:
             banner_url = None
  
-        # 10) Thumbnail image (optional — small image, top-right of the embed)
+        # Thumbnail image
         thumbnail_url = await prompt_for_text(
             dm_channel, user.id, "**Thumbnail image URL?** (small image, top-right — optional)",
             validator=validate_url, allow_skip=True,
@@ -2099,26 +1754,22 @@ async def run_event_setup(user, guild, origin_channel, dm_channel):
             "creator_id": user.id,
             "creator_name": creator_name,
             "created_epoch": int(datetime.now(timezone.utc).timestamp()),
-            "categories": {},        # filled in as people RSVP
-            "display_names": {},     # {user_id_str: display_name}, cached so the embed never needs a live API call to render
+            "categories": {},
+            "display_names": {},
             "channel_id": target_channel.id,
             "guild_id": guild.id,
             "reminder_sent": False,
-            # Snapshotting the emoji map onto the event itself (rather than
-            # always reading BATTALION_COMPANIES live) means an admin can
-            # freely edit the config for FUTURE events without breaking
-            # reaction handling on ones already posted.
             "emoji_map": {info["emoji"]: key for key, info in BATTALION_COMPANIES.items()} if event_type == EVENT_TYPE_GENERAL else {},
         }
  
-        # 11) Preview + confirm
+        # Preview/confirm
         preview_embed = build_event_embed(event)
         await dm_channel.send(f"**Preview** — this is exactly what will be posted in {target_channel.mention}:", embed=preview_embed)
         confirm_view = ConfirmView(author_id=user.id)
         await send_view(dm_channel, "Post it?", confirm_view)
         await require_view_value(confirm_view, dm_channel)  # only "confirm" reaches this line without raising
  
-        # 12) Post it
+        # Posting the event
         await post_event(dm_channel, guild, target_channel, event)
  
     except EventSetupCancelled:
@@ -2136,15 +1787,12 @@ async def run_event_setup(user, guild, origin_channel, dm_channel):
         except discord.Forbidden:
             pass  # they closed their DMs mid-setup — nothing more we can do
  
- 
-# ----- G. The /event command -------------------------------------------------
+# ----- Command -------------------------------------------------
  
 @bot.tree.command(name="event", description="Create an event for members to RSVP to. Setup happens in your DMs.")
 @require_role()
 async def event_command(interaction: discord.Interaction):
-    # Only one setup wizard per user at a time — otherwise two /event runs
-    # would both be waiting on messages in the same DM channel and very
-    # likely collide, each thinking the other's answers were its own.
+    # Only one setup wizard per user at a time
     if interaction.user.id in active_setups:
         await interaction.response.send_message(
             embed=make_error_embed(
@@ -2154,10 +1802,7 @@ async def event_command(interaction: discord.Interaction):
             ephemeral=True,
         )
         return
- 
-    # Remember exactly where the command was called from BEFORE jumping
-    # into DMs — this is what lets the wizard offer "post it back here"
-    # as its default, one-click channel option.
+
     origin_channel = interaction.channel
     guild = interaction.guild
  
@@ -2194,17 +1839,11 @@ async def event_command(interaction: discord.Interaction):
         await run_event_setup(interaction.user, guild, origin_channel, dm_channel)
     finally:
         active_setups.discard(interaction.user.id)
- 
- 
-# ----- H. Persistent RSVP button view (company events) ---------------------
+
+# ----- Company event buttons ---------------------
  
 class EventRSVPView(discord.ui.View):
-    """Persistent view attached to every company-specific event embed.
-    Registered once in setup_hook via bot.add_view(), so the buttons keep
-    working after a bot restart without the message needing to be
-    resent. Every button routes through _handle(), which figures out
-    which event it belongs to from interaction.message — nothing needs to
-    be encoded in the custom_id."""
+    # Persistent view attached to every company-specific event embed
  
     def __init__(self):
         super().__init__(timeout=None)
@@ -2224,8 +1863,7 @@ class EventRSVPView(discord.ui.View):
  
             user_id = interaction.user.id
             if EVENT_RSVP_MUTUALLY_EXCLUSIVE:
-                # A member can only hold ONE RSVP status at a time — picking
-                # a new one clears any previous one automatically.
+                # A member can only hold one RSVP status at a time
                 for key in ("accepted", "declined", "tentative"):
                     if key != status_key:
                         other_bucket = event["categories"].setdefault(key, [])
@@ -2234,7 +1872,8 @@ class EventRSVPView(discord.ui.View):
  
             bucket = event["categories"].setdefault(status_key, [])
             if user_id in bucket:
-                bucket.remove(user_id)  # clicking your current status again clears it
+                # Clicking your current status again clears it
+                bucket.remove(user_id)
             else:
                 bucket.append(user_id)
             event["display_names"][str(user_id)] = interaction.user.display_name
@@ -2265,17 +1904,14 @@ class EventRSVPView(discord.ui.View):
         await self._handle(interaction, "tentative")
  
  
-# ----- I. Reaction handling (general events) --------------------------------
+# ----- Reaction handling --------------------------------
  
 def request_event_refresh(event):
-    """Schedules an embed refresh a short moment from now instead of
-    editing on every single reaction — a burst of people reacting at
-    once (e.g. right when the event goes up) then costs one Discord API
-    call instead of dozens."""
+    # Schedules an embed refresh
     message_id = event["message_id"]
     existing = _pending_refresh_tasks.get(message_id)
     if existing and not existing.done():
-        return  # a refresh is already queued for this message; nothing more to do
+        return
     _pending_refresh_tasks[message_id] = asyncio.create_task(_debounced_refresh(event))
  
  
@@ -2283,7 +1919,7 @@ async def _debounced_refresh(event):
     try:
         await asyncio.sleep(EVENT_REFRESH_DEBOUNCE_SECONDS)
         if event["message_id"] not in active_events:
-            return  # deleted / no longer tracked while we were waiting
+            return
         await refresh_event_message(event)
         await save_events()
     except Exception as e:
@@ -2304,19 +1940,17 @@ async def refresh_event_message(event):
  
  
 async def handle_event_reaction(payload, adding):
-    """Shared logic for on_raw_reaction_add/remove: keeps a GENERAL
-    event's per-company attendance lists in sync with the reactions on
-    its message. Company events use buttons instead (EventRSVPView), so
-    this only ever touches general events."""
     if payload.user_id == bot.user.id:
-        return  # ignore the bot's own placeholder reactions
+        # ignore the bot's own placeholder reactions
+        return
     event = active_events.get(payload.message_id)
     if event is None or event["type"] != EVENT_TYPE_GENERAL:
         return
  
     company_key = event["emoji_map"].get(str(payload.emoji))
     if company_key is None:
-        return  # someone reacted with an unrelated emoji — ignore it
+        # someone reacted with an unrelated emoji
+        return
  
     guild = bot.get_guild(event["guild_id"])
     if guild is None:
@@ -2324,7 +1958,8 @@ async def handle_event_reaction(payload, adding):
     try:
         member = payload.member or guild.get_member(payload.user_id) or await guild.fetch_member(payload.user_id)
     except discord.NotFound:
-        return  # they reacted then immediately left the server
+        # they reacted then immediately left the server (:sob:)
+        return
  
     bucket = event["categories"].setdefault(company_key, [])
     changed = False
@@ -2339,29 +1974,24 @@ async def handle_event_reaction(payload, adding):
  
     event["display_names"][str(payload.user_id)] = member.display_name
     request_event_refresh(event)
- 
- 
+
 @bot.event
 async def on_raw_reaction_add(payload):
     try:
         await handle_event_reaction(payload, adding=True)
     except Exception as e:
         print(f"Error handling event reaction add: {e}")
- 
- 
+
 @bot.event
 async def on_raw_reaction_remove(payload):
     try:
         await handle_event_reaction(payload, adding=False)
     except Exception as e:
         print(f"Error handling event reaction remove: {e}")
- 
- 
+
 @bot.event
 async def on_raw_message_delete(payload):
-    """Stops tracking an event if its message gets deleted, so the bot
-    doesn't keep trying to edit or remind something that no longer
-    exists."""
+    # Stops tracking an event if its message gets deleted
     event = active_events.pop(payload.message_id, None)
     if event is None:
         return
@@ -2372,15 +2002,11 @@ async def on_raw_message_delete(payload):
         await save_events()
     except Exception as e:
         print(f"Error saving events after message delete: {e}")
- 
- 
-# ----- J. 20-minutes-out reminder thread + ping -----------------------------
+
+# ----- 20 minute reminder -----------------------------
  
 def schedule_event_reminder(event):
-    """Fires the reminder as a background asyncio task. Safe to call
-    again for an event that already has one scheduled (e.g. on reload
-    from disk at startup) — cancels any previous task first so two
-    timers never race each other."""
+    # Fires the reminder as a background asyncio task
     message_id = event.get("message_id")
     if message_id is None:
         return
@@ -2394,14 +2020,10 @@ def schedule_event_reminder(event):
     reminder_dt = start_dt - timedelta(minutes=EVENT_REMINDER_LEAD_MINUTES)
     delay = (reminder_dt - datetime.now(timezone.utc)).total_seconds()
     if delay <= 0:
-        # Event starts too soon (or has already started) for a reminder to
-        # make sense — matches the spec: "doesn't apply if the event was
-        # created within 20 minutes from its start."
         return
  
     reminder_tasks[message_id] = asyncio.create_task(_fire_reminder_after_delay(event, delay))
- 
- 
+
 async def _fire_reminder_after_delay(event, delay):
     try:
         await asyncio.sleep(delay)
@@ -2410,12 +2032,9 @@ async def _fire_reminder_after_delay(event, delay):
         pass
     except Exception as e:
         print(f"Error firing reminder for event {event.get('message_id')}: {e}")
- 
- 
+
 async def _send_chunked(destination, prefix, mentions, allowed_mentions, chunk_size=1900):
-    """Sends a big block of user mentions across as many messages as
-    needed to stay under Discord's 2000-character limit, instead of
-    letting one giant battalion-wide ping fail outright."""
+    # Sends the block of mentions in more messages if needed
     text = " ".join(mentions)
     first = True
     while text:
@@ -2427,15 +2046,12 @@ async def _send_chunked(destination, prefix, mentions, allowed_mentions, chunk_s
         await destination.send((prefix if first else "") + chunk, allowed_mentions=allowed_mentions)
         text = text[len(chunk):].lstrip()
         first = False
- 
- 
+
 async def send_event_reminder(event):
-    """Creates a thread under the event message and pings everyone
-    attending: all reacted users for a general event, or Accepted +
-    Tentative for a company event."""
     message_id = event["message_id"]
     if message_id not in active_events or event.get("reminder_sent"):
-        return  # deleted, or somehow already handled
+        # deleted, or somehow already handled
+        return
  
     channel = bot.get_channel(event["channel_id"])
     if channel is None:
@@ -2472,51 +2088,17 @@ async def send_event_reminder(event):
 # ============================================================
 # REQUEST SYSTEM  (/requestpanel + LOA / Discharge buttons)
 # ============================================================
-# How it works, end to end:
-#   1. A staff member runs /requestpanel -> the bot posts the info embeds
-#      plus one button per request type (built from REQUEST_TYPES).
-#   2. Someone clicks a button -> the bot DMs them the format to fill in.
-#   3. They reply with ONE message. The parser checks it; on any mistake
-#      they get a precise error and can simply try again (until it expires
-#      or they type "cancel").
-#   4. A valid request gets an ID (LOA-0001 / DIS-0001 ...), is written to
-#      the log file, and is posted in the right channel with Accept / Deny
-#      buttons. Discharge requests also ping the submitter's company HQ.
-#   5. A reviewer (REQUEST_REVIEWER_ROLE_IDS) presses Accept, or Deny (which
-#      opens a pop-up asking for the reason). The embed updates in place and
-#      the buttons disappear.
-#
-# API-usage notes (why this is cheap):
-#   • No Google Sheets calls at all.
-#   • Roles/permissions are read from the interaction payload — zero fetches.
-#   • Reviews edit the message through the interaction response itself,
-#     so there's no extra fetch_message / edit call.
-#   • The log is written atomically in a background thread, only when
-#     something actually changed.
-#
-# Layout of this section:
-#   A. In-memory state + JSON log persistence
-#   B. Small helpers (permissions, company lookup, IDs, time)
-#   C. Embed builders (DM format, posted request, panel)
-#   D. Format parser (the "handle every wrong format" part)
-#   E. The DM session behind the panel buttons
-#   F. Posting a validated request
-#   G. Accept / Deny (persistent view + deny-reason modal)
-#   H. Panel view + the /requestpanel command
+
+# ----- Persistence ------------------------------------------------
  
- 
-# ----- A. State + persistence ------------------------------------------------
- 
-request_log = {}              # {request_id: record} — the full log, mirrored to REQUESTS_LOG_FILE
-request_message_index = {}    # {message_id: request_id} — lets a button click find its request instantly
-request_counters = {}         # {prefix: last number used} — e.g. {"LOA": 10, "DIS": 16}
-active_request_sessions = set()   # user_ids currently filling a form in their DMs (one at a time each)
-_requests_write_lock = asyncio.Lock()  # stops two saves from writing the file at the same moment
- 
- 
+request_log = {} # {request_id: record} — the full log, mirrored to REQUESTS_LOG_FILE
+request_message_index = {} # {message_id: request_id} — lets a button click find its request instantly
+request_counters = {} # {prefix: last number used} — e.g. {"LOA": 10, "DIS": 16}
+active_request_sessions = set() # user_ids currently filling a form in their DMs (one at a time each)
+_requests_write_lock = asyncio.Lock() # stops two saves from writing the file at the same moment
+
 def _write_requests_file(snapshot_json):
-    """Runs in a background thread. Writes to a temp file first and then
-    swaps it in, so a crash mid-write can never leave a half-written log."""
+    # Runs in a background thread
     tmp_path = REQUESTS_LOG_FILE + ".tmp"
     with open(tmp_path, "w", encoding="utf-8") as f:
         f.write(snapshot_json)
@@ -2524,9 +2106,7 @@ def _write_requests_file(snapshot_json):
  
  
 async def save_requests():
-    """Persists the log. The JSON string is built HERE (on the event loop,
-    a few ms) and only the file write goes to a thread — this way another
-    request can't modify the dict while it is being serialized."""
+    # Persists the log
     async with _requests_write_lock:
         try:
             snapshot = json.dumps(request_log, indent=2, ensure_ascii=False)
@@ -2536,15 +2116,14 @@ async def save_requests():
  
  
 def load_requests():
-    """Loads the log at startup and rebuilds the message index + ID counters
-    from it, so numbering carries on where it left off after a restart."""
+    # Loads the log at startup
     if not os.path.exists(REQUESTS_LOG_FILE):
         return
     try:
         with open(REQUESTS_LOG_FILE, "r", encoding="utf-8") as f:
             raw = json.load(f)
     except (json.JSONDecodeError, OSError) as e:
-        # Keep the unreadable file as a backup instead of silently overwriting it on the next save.
+        # Keep the unreadable file as a backup
         print(f"Could not read {REQUESTS_LOG_FILE} ({e}); keeping it as .corrupt and starting fresh.")
         try:
             os.replace(REQUESTS_LOG_FILE, REQUESTS_LOG_FILE + ".corrupt")
@@ -2554,39 +2133,29 @@ def load_requests():
  
     request_log.update(raw)
     for request_id, record in raw.items():
-        if record.get("status") == "processing": # bot died mid-discharge -> make it reviewable again
+        if record.get("status") == "processing": # bot died mid discharge (rip)
             record["status"] = "pending"
         prefix, _, number = request_id.rpartition("-")
         request_counters[prefix] = max(request_counters.get(prefix, 0), safe_int(number))
         if record.get("message_id"):
             request_message_index[record["message_id"]] = request_id
- 
- 
-# ----- helpers ------------------------------------------------------
+
+# ----- Helpers ------------------------------------------------------
  
 def now_epoch():
     return int(datetime.now(timezone.utc).timestamp())
- 
- 
+
 def member_has_any_role(member, role_ids):
-    """True if `member` holds at least one role whose ID is in `role_ids`.
-    (False in DMs, where there are no roles.)"""
     return isinstance(member, discord.Member) and any(role.id in role_ids for role in member.roles)
- 
- 
+
 def require_roles(role_ids):
-    """Like require_role(), but for a specific set of role IDs. The set is
-    read on every call, so editing it in the config block is all it takes.
-    A failure lands in on_app_command_error as the usual 'Permission Denied'."""
     async def predicate(interaction: discord.Interaction) -> bool:
         return member_has_any_role(interaction.user, role_ids)
     return app_commands.check(predicate)
  
  
 def resolve_company(member):
-    """Looks at the member's roles and returns (company_name, hq_role_id).
-    Exactly ONE matching company role -> that company + its HQ role.
-    Zero or several -> (REQUEST_COMPANY_FALLBACK, None), i.e. "N/A" and no HQ ping."""
+    # Looks at the member's roles and returns (company_name, hq_role_id)
     member_role_ids = {role.id for role in member.roles}
     matches = [info for role_id, info in REQUEST_COMPANIES.items() if role_id in member_role_ids]
     if len(matches) == 1:
@@ -2595,25 +2164,20 @@ def resolve_company(member):
  
  
 def next_request_id(kind):
-    """Hands out the next ID for this request type: LOA-0011, DIS-0017 ...
-    (No await in here, so two requests can never receive the same number.)"""
+    # Hands out the next ID for this request type: LOA-0011, DIS-0017, etc...
     prefix = REQUEST_TYPES[kind]["prefix"]
     number = request_counters.get(prefix, 0) + 1
     request_counters[prefix] = number
     return f"{prefix}-{number:04d}"
- 
- 
+
 def release_request_id(request_id):
-    """Gives an ID back if posting failed, so numbering has no gaps
-    (only if nobody else took a newer number in the meantime)."""
+    # Gives an ID back if posting failed
     prefix, _, number = request_id.rpartition("-")
     if request_counters.get(prefix) == safe_int(number):
         request_counters[prefix] = safe_int(number) - 1
- 
- 
+
 def get_request_channel(kind):
-    """The channel this request type is posted in, or None if it doesn't
-    exist / the bot can't post there. Uses the cache — no API call."""
+    # The channel this request type is posted in
     channel = bot.get_channel(REQUEST_TYPES[kind]["channel_id"])
     if not isinstance(channel, discord.TextChannel):
         return None
@@ -2621,23 +2185,18 @@ def get_request_channel(kind):
     if not (perms.view_channel and perms.send_messages and perms.embed_links):
         return None
     return channel
- 
- 
-# ----- C. Embed builders -------------------------------------------------------
+
+# ----- Embed builders -------------------------------------------------------
  
 def format_template(kind, discord_username):
-    """The fill-in-the-blanks text: one 'Label:' line per field, with the
-    person's Discord username already filled in."""
     lines = []
     for field in REQUEST_TYPES[kind]["fields"]:
         prefill = f" {discord_username}" if field["key"] == "discord_username" else ""
         lines.append(f"{field['label']}:{prefill}")
     return "\n".join(lines)
  
- 
 def build_format_embed(kind, discord_username, errors=None):
-    """The embed DM'd to the requester. With `errors`, it becomes the
-    'invalid format' reply: the same template again, plus what was wrong."""
+    # The embed DM'd to the requester
     cfg = REQUEST_TYPES[kind]
     template = f"```\n{format_template(kind, discord_username)}\n```"
  
@@ -2663,8 +2222,7 @@ def build_format_embed(kind, discord_username, errors=None):
         )
     embed.set_footer(text=REQUEST_FOOTER)
     return embed
- 
- 
+
 def build_request_embed(record):
     # Builds the posted request embed from a log record
     cfg = REQUEST_TYPES[record["type"]]
@@ -2696,7 +2254,7 @@ def build_request_embed(record):
         status_text = REQUEST_PENDING_TEXT
     embed.add_field(name="Status", value=status_text, inline=False)
 
-    # Summary of what the auto-discharge did on the ORBAT (only exists on accepted discharges)
+    # Summary of what the auto discharge did on the ORBAT
     if record.get("orbat_note"):
         embed.add_field(name="ORBAT", value=truncate_field(record["orbat_note"]), inline=False)
     
@@ -2704,30 +2262,27 @@ def build_request_embed(record):
         embed.add_field(name="Denial Reason", value=truncate_field(record.get("denial_reason")), inline=False)
  
     embed.set_footer(text=f"Request ID: {record['id']}")
-    # Timestamp = when it was last touched (submitted, then reviewed).
+    # Timestamp = when it was last touched (submitted, or reviewed)
     embed.timestamp = datetime.fromtimestamp(record.get("reviewed_epoch") or record["submitted_epoch"], tz=timezone.utc)
     return embed
- 
- 
+
 def build_panel_embeds():
     return [
         discord.Embed(title=e["title"], description=e["description"], color=e["color"])
         for e in REQUEST_PANEL_EMBEDS
     ]
- 
- 
+
 # ----- Format parser ----------------------------------------------------------
  
 def _normalize_label(text):
     return re.sub(r"[\s*_`]+", "", text).lower()
- 
- 
+
 def parse_request_message(text, cfg):
     # Turns the user's reply into {field_key: value}
 
     fields = cfg["fields"]
     by_label = {_normalize_label(f["label"]): f for f in fields}
-    text = re.sub(r"```[a-zA-Z]*", "", text) # drop code-fence markers if the format was pasted as a block
+    text = re.sub(r"```[a-zA-Z]*", "", text) # drop code fence markers if the format was pasted as a block
  
     chunks = {f["key"]: [] for f in fields} # raw lines collected per field
     seen, duplicates = set(), []
@@ -2738,7 +2293,7 @@ def parse_request_message(text, cfg):
         head, sep, rest = line.partition(":")
         field = by_label.get(_normalize_label(head)) if sep else None
  
-        if field: # a 'Label:' line
+        if field:
             if field["key"] in seen:
                 if field["label"] not in duplicates:
                     duplicates.append(field["label"])
@@ -2769,7 +2324,7 @@ def parse_request_message(text, cfg):
         elif len(value) > field["max_len"]:
             errors.append(f"**{field['label']}** is too long ({len(value)}/{field['max_len']} characters).")
         elif field.get("type") == "date_range":
-            # Two dates expected: validate, then store them in a clean normalized format
+            # Two dates expected
             try:
                 leave, ret, _ = parse_leave_period(value, strict=True)
             except ValueError as e:
@@ -2785,8 +2340,7 @@ def parse_request_message(text, cfg):
         errors.append("These fields are empty: " + ", ".join(f"**{e}**" for e in empty) + ".")
  
     return (None if errors else values), errors
- 
- 
+
 # ----- DM -----------------------------
  
 async def collect_request_form(user, dm_channel, kind):
@@ -2821,11 +2375,11 @@ async def collect_request_form(user, dm_channel, kind):
         if values is not None:
             return values
         await dm_channel.send(embed=build_format_embed(kind, user.name, errors=errors))
-        # Loop: wait for their corrected message
+        # Loop wait for their corrected message
  
  
 async def start_request_session(interaction, kind):
-    """Runs when a panel button is clicked."""
+    # Runs when a panel button is clicked
     cfg = REQUEST_TYPES[kind]
     user = interaction.user
  
@@ -2851,7 +2405,6 @@ async def start_request_session(interaction, kind):
         )
         return
 
-    # no await since the check above -> can't be double-clicked past
     active_request_sessions.add(user.id)
     try:
         # Acknowledge inside discord's 3 second window, then DM the format
@@ -2892,8 +2445,7 @@ async def start_request_session(interaction, kind):
         print(f"Error in request session for {user}: {e}")
     finally:
         active_request_sessions.discard(user.id) # always free the slot
- 
- 
+
 # ----- Posting the request ---------------------------------------------
  
 async def submit_request(dm_channel, kind, values, submitter, company, hq_role_id, guild_id):
@@ -2907,7 +2459,7 @@ async def submit_request(dm_channel, kind, values, submitter, company, hq_role_i
         return
  
     if REQUEST_FORCE_REAL_DISCORD_USERNAME and "discord_username" in values:
-        values["discord_username"] = submitter["username"]  # can't be spoofed
+        values["discord_username"] = submitter["username"]
  
     request_id = next_request_id(kind)
     record = {
@@ -2941,7 +2493,7 @@ async def submit_request(dm_channel, kind, values, submitter, company, hq_role_i
             content=ping_content, embed=build_request_embed(record), view=RequestReviewView(), allowed_mentions=allowed
         )
     except discord.HTTPException as e:
-        # nothing was posted -> undo, keep the log and numbering clean
+        # nothing was posted, undo
         request_log.pop(request_id, None)
         release_request_id(request_id)
         print(f"Could not post {request_id}: {e}")
@@ -2960,13 +2512,11 @@ async def submit_request(dm_channel, kind, values, submitter, company, hq_role_i
         color=EMBED_COLOR_SUCCESS,
     ))
     print(f"Posted {request_id} ({company}).")
- 
- 
-# ----- Accept / Deny -------------------------------------------------------------
+
+# ----- Accept/Deny -------------------------------------------------------------
  
 async def finalize_review(interaction, record, decision, reason=None):
-    #Applies Accept/Deny: updates the record, edits the message in place (buttons removed), and saves the log
-    # The status check and the update below have no "await" between them so two reviewers clicking at once can't both succeed
+    # Updates the record, edits the message in place (buttons removed), and saves the log
     if record["status"] != "pending":
         await interaction.response.send_message(
             embed=make_error_embed("Already Reviewed", "Someone else already handled this request."), ephemeral=True
@@ -2975,7 +2525,6 @@ async def finalize_review(interaction, record, decision, reason=None):
  
     record.update(status=decision, reviewer_id=interaction.user.id, reviewed_epoch=now_epoch(), denial_reason=reason)
     try:
-        # Editing through the interaction response = no extra fetch/edit API calls.
         await interaction.response.edit_message(embed=build_request_embed(record), view=None)
     except discord.HTTPException as e:
         record.update(status="pending", reviewer_id=None, reviewed_epoch=None, denial_reason=None)  # undo
@@ -2985,7 +2534,7 @@ async def finalize_review(interaction, record, decision, reason=None):
     print(f"{record['id']} {decision} by {interaction.user}.")
  
 def discharge_company_keys_for(record):
-    #Which company sheet(s) to clear for this request
+    # Which company sheet/s to clear for this request
     for info in REQUEST_COMPANIES.values():
         if info["name"] == record["company"] and info.get("discharge_key") in DISCHARGE_COMPANIES:
             return [info["discharge_key"]]
@@ -2993,7 +2542,7 @@ def discharge_company_keys_for(record):
 
 
 def build_orbat_note(result):
-    #Turns process_discharge()'s result into the small 'ORBAT' field shown on the request embed
+    # Turns process_discharge()'s result into the small 'ORBAT' field shown on the request embed
     lines = [
         f"**{result['designation']}** • {result['previous_rank']}",
         f"Filed in {DISCHARGE_SHEET_NAME} (row {result['log_row']})",
@@ -3036,17 +2585,13 @@ async def file_loa_for_request(record, interaction):
     )
     return build_loa_note(result)
 
-
-# request type -> function that files it. To auto-file a new request type write a filer and add one line here
-# A filer takes (record, interaction), returns the note text, and raises DischargeError/LOAError on expected failures
 ACCEPT_FILERS = {
     "discharge": file_discharge_for_request,
     "loa": file_loa_for_request,
 }
 
-
 async def accept_and_file(interaction, record):
-    # Accept = run the type's filer, then mark the request accepted. If filing fails, the request stays pending
+    # Accept = run the type's filer, then mark the request accepted
     # Busy rule
     if command_lock.locked():
         await interaction.response.send_message(embed=make_busy_embed(), ephemeral=True)
@@ -3109,7 +2654,6 @@ class DenyReasonModal(discord.ui.Modal, title="Deny Request"):
 
 class RequestReviewView(discord.ui.View):
     # Manages the persistence of accept/deny buttons
- 
     def __init__(self):
         super().__init__(timeout=None)
  
@@ -3121,8 +2665,6 @@ class RequestReviewView(discord.ui.View):
                 embed=make_error_embed("Permission Denied", "Only HQ can accept or deny requests."), ephemeral=True
             )
             return None
-        # interaction.message is the message the button/modal was attached to; discord.py carries it through from the button click into the
-        # deny-reason modal's on_submit too. Guarded here just in case a future discord.py version ever stops attaching it.
         if interaction.message is None:
             await interaction.response.send_message(
                 embed=make_error_embed("Something Went Wrong", "I've got no clue which request this was for, please try again."),
@@ -3182,15 +2724,13 @@ class RequestPanelView(discord.ui.View):
         async def callback(interaction: discord.Interaction):
             await start_request_session(interaction, kind)
         return callback
- 
- 
+
 @bot.tree.command(name="requestpanel", description="Post the LOA / Discharge request panel.")
 @app_commands.describe(channel="Where to post the panel (defaults to this channel).")
 @require_roles(REQUEST_PANEL_ROLE_IDS)
 async def requestpanel(interaction: discord.Interaction, channel: Optional[discord.TextChannel] = None):
     target = channel or interaction.channel
- 
-    # Check the bot can actually post there
+
     perms = target.permissions_for(interaction.guild.me)
     if not (perms.view_channel and perms.send_messages and perms.embed_links):
         await interaction.response.send_message(
@@ -3216,12 +2756,12 @@ async def requestpanel(interaction: discord.Interaction, channel: Optional[disco
     )
 
 # ============================================================
-# DISCHARGE SYSTEM  (/discharge)
+# DISCHARGE SYSTEM
 # ============================================================
 
 # ----- CONFIG ---------------------------------------------------------------
 
-# Sheet names. They must match the tab names EXACTLY
+# Sheet names. They must match the tab names exactly
 DISCHARGE_SHEET_NAME = "442nd DISCHARGE"
 DISCHARGE_SCHOOL_SHEET_NAME = "442nd SCHOOL"
  
@@ -3245,13 +2785,13 @@ DISCHARGE_DATE_FORMAT = "%d/%m/%Y"
 DISCHARGE_REASON_MAX = 500
  
 # The next two lists are for the 2 dropdown menus
-# To add a company: add one line here, nothing else needs to change.
+# To add a company add one line here
 DISCHARGE_COMPANIES = {
     "horn":      {"label": "Horn",      "sheet": "442nd HORN"},
     "doom":      {"label": "Doom",      "sheet": "442nd DOOM"},
     "manticore": {"label": "Manticore", "sheet": "442nd MANTICORE"},
     "viper":     {"label": "Viper",     "sheet": "442nd VIPER"},
-    "hq":        {"label": "Havoc/HQ",  "sheet": "442nd HQ"},   # the HQ sheet also holds the Havoc members
+    "hq":        {"label": "Havoc/HQ",  "sheet": "442nd HQ"}, # the HQ sheet also holds the Havoc members
 }
 
 DISCHARGE_TYPES = {
@@ -3265,13 +2805,12 @@ DISCHARGE_TYPES = {
 #   "F"    -> that single column
 #   "R:AN" -> every column from R to AN (inclusive)
 # Use "" to empty a cell, 0 for zero, False to untick a checkbox.
- 
-# Company sheets: just empty the username cell.
+
 COMPANY_WIPE_RULES = [
     (SHEET_USERNAME_COL, ""),
 ]
  
-# School sheet: empty the username + untick the 3 checkboxes (J, K, L).
+# SCHOOL sheet, empty the username + untick the 3 checkboxes (J, K, L)
 SCHOOL_WIPE_RULES = [
     (SHEET_USERNAME_COL, ""),
     ("J:L", False),
@@ -3286,20 +2825,17 @@ DATA_WIPE_RULES = [
     ("E", "Cadet"), # rank
     ("R:AN", False), # all checkboxes
 ]
- 
- 
+
 # ----- HELPERS ---------------------------------------------------------------
  
 def col_number(letter):
-    # 'D' -> 4, 'AN' -> 40. Lets the config use normal sheet letters.
+    # 'D' -> 4, 'AN' -> 40. Lets the config use normal sheet letters
     return a1_to_rowcol(f"{letter}1")[1]
- 
- 
+
 def quoted_range(sheet_title, a1):
     # Builds "'442nd HORN'!D5"
     return f"'{sheet_title}'!{a1}"
- 
- 
+
 def sheet_safe_text(text):
     # Avoiding user-entered formulas
     text = str(text)
@@ -3307,7 +2843,7 @@ def sheet_safe_text(text):
  
  
 def build_rule_updates(sheet_title, row, rules):
-    #Turns a rule list like [("D", ""), ("J:L", False)] into the update entries the batch write expects, for ONE row of ONE sheet
+    #Turns a rule list like [("D", ""), ("J:L", False)] into the update entries the batch write expects, for one row of one sheet
     updates = []
     for cols, value in rules:
         first, _, last = cols.partition(":")
@@ -3321,7 +2857,7 @@ def build_rule_updates(sheet_title, row, rules):
  
  
 def find_rows(column_values, username):
-    # Returns the sheet row numbers (1-indexed) whose username cell matches `username` (case-insensitive)
+    # Returns the sheet row numbers (1-indexed) whose username cell matches 'username' (case-insensitive)
     target = username.strip().lower()
     return [
         i + 1
@@ -3341,7 +2877,7 @@ def first_free_row(column_values, start_row):
 # ----- SHEET I/O -----------------------------------------------------------------
  
 def fetch_discharge_data(company_sheet_names):
-    # Request that reads the username column of: Data, DISCHARGE, SCHOOL + every given company sheet
+    # Request that reads the username column of Data, DISCHARGE, SCHOOL + every given company sheet
     username_col = f"{SHEET_USERNAME_COL}:{SHEET_USERNAME_COL}"
     ranges = [
         quoted_range(sheet.title, f"A1:F{DATA_END_ROW}"),
@@ -3361,7 +2897,7 @@ def write_discharge_updates(updates):
     sh.values_batch_update({"valueInputOption": "USER_ENTERED", "data": updates})
 
 class DischargeError(Exception):
-    #Expected failure with a ready-to-show title + message. Callers catch it and show it however they like
+    # Expected failure message
     def __init__(self, title, message):
         super().__init__(message)
         self.title = title
@@ -3372,7 +2908,7 @@ async def process_discharge(username, company_keys, discharge_type, reason, sign
     company_sheet_names = [DISCHARGE_COMPANIES[key]["sheet"] for key in company_keys]
 
     try:
-        # One batch read for every sheet we need
+        # One batch read for every sheet
         data_rows, discharge_col, school_col, company_cols = await asyncio.to_thread(
             fetch_discharge_data, company_sheet_names
         )
@@ -3415,7 +2951,7 @@ async def process_discharge(username, company_keys, discharge_type, reason, sign
             if rows:
                 company_hits.append(sheet_name)
 
-        # School sheet: clear username + untick checkboxes
+        # School sheet
         school_rows = find_rows(school_col, display_name)
         for row_number in school_rows:
             updates += build_rule_updates(DISCHARGE_SCHOOL_SHEET_NAME, row_number, SCHOOL_WIPE_RULES)
@@ -3549,13 +3085,13 @@ async def discharge(
             )
 
 # ============================================================
-# /rank  — set a member's rank directly in the Data sheet, bypassing the BE points subtraction of promotions from pvt to lcpl.
-# Obviously use /promote for regular LR promotions.
+# /rank
+# set a member's rank directly in the Data sheet 
+# Obviously use /promote for regular LR promotions
 # ============================================================
 
 RANK_COMMAND_COLUMNS = (COL_USERNAME, COL_RANK, COL_DESIGNATION)
 
-# Embed colors for the two outcomes (reuses the global palette).
 RANK_COLOR_CHANGED   = EMBED_COLOR_SUCCESS
 RANK_COLOR_UNCHANGED = EMBED_COLOR_GOLD
 
@@ -3668,7 +3204,7 @@ async def rank_command(interaction: discord.Interaction, username: str, rank: ap
             )
 
 # ============================================================
-# LOA SYSTEM  (sheet filing + date parsing)
+# LOA SYSTEM
 # ============================================================
 
 # ----- CONFIG ---------------------------------------------------------------
@@ -3690,25 +3226,23 @@ LOA_MAX_DAYS = 30 # None = no limit
 LOA_DATE_REGEX = re.compile(r"(?<!\d)(\d{1,2})/(\d{1,2})/(\d{4})(?!\d)")
 
 # --- /loa and /removeloa -----------------------------------------------------
-LOA_COMMAND_DATE_FORMAT  = "%d/%m/%Y" # what /loa accepts (strptime pattern). The SHEET format is still LOA_DATE_FORMAT.
+LOA_COMMAND_DATE_FORMAT  = "%d/%m/%Y" # what /loa accepts (strptime pattern)
 LOA_COMMAND_DATE_HINT    = "DD/MM/YYYY" # shown in error messages
 LOA_COMMAND_DATE_EXAMPLE = "23/07/2026"
-LOA_REASON_MAX           = 1000 # same cap as the request form
+LOA_REASON_MAX           = 1000
 LOA_COLOR_ADDED          = EMBED_COLOR_SUCCESS
 LOA_COLOR_REMOVED        = 0xE67E22 # orange
 
-# /removeloa wipe rules: same format as DATA_WIPE_RULES ("F" = one column, "F:G" = a span, "" = empty the cell).
+# /removeloa wipe rules: same format as DATA_WIPE_RULES ("F" = one column, "F:G" = a span, "" = empty the cell)
 LOA_WIPE_RULES = [
     (SHEET_USERNAME_COL, ""),
     ("F:G", ""),
     ("H", ""),
 ]
 
-
 class LOAError(DischargeError):
-    # Expected LOA failure with a title + message (same shape as DischargeError)
+    # Expected LOA failure message
     pass
-
 
 # ----- DATE HELPERS ------------------------------------------------------------
 
@@ -3859,7 +3393,6 @@ def build_loa_note(result):
         f"🗓️ {result['leave']} → {result['return']} • **{result['days']} day{'s' if result['days'] != 1 else ''}**"
     )
 
-
 # ------------------------------------------------------------
 # /loa
 # ------------------------------------------------------------
@@ -3925,7 +3458,6 @@ async def loa_command(
             await interaction.followup.send(
                 embed=make_error_embed("Something Went Wrong", "An error occurred while processing the command.")
             )
-
 
 # ------------------------------------------------------------
 # /removeloa
