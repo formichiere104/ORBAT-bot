@@ -6,3 +6,6 @@ venv/
 events_data.json
 requests_log.json
 .corrupt
+blacklist_data.json
+blacklist_data.json.tmp
+blacklist_data.json.corrupt

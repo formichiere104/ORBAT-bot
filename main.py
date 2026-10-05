@@ -288,6 +288,101 @@ REQUEST_PANEL_EMBEDS = [
 ]
 
 # ============================================================
+# BLACKLIST CONFIG
+# ============================================================
+BLACKLIST_FILE = "blacklist_data.json"
+BLACKLIST_ADMIN_ROLE_IDS = {
+    1423287377111023679,
+}
+
+blacklist_entries = {}
+_blacklist_write_lock = asyncio.Lock()
+
+# Blacklist helper functions
+
+def _write_blacklist_file(snapshot_json):
+    tmp_path = BLACKLIST_FILE + ".tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        f.write(snapshot_json)
+    os.replace(tmp_path, BLACKLIST_FILE)
+
+async def save_blacklist():
+    async with _blacklist_write_lock:
+        try:
+            snapshot = json.dumps(blacklist_entries, indent=2, ensure_ascii=False)
+            await asyncio.to_thread(_write_blacklist_file, snapshot)
+        except OSError as e:
+            print(f"Failed to save blacklist to {BLACKLIST_FILE}: {e}")
+            raise
+
+def load_blacklist():
+    if not os.path.exists(BLACKLIST_FILE):
+        return
+
+    try:
+        with open(BLACKLIST_FILE, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+
+        if not isinstance(raw, dict):
+            raise ValueError("Blacklist file must contain a JSON object.")
+
+        blacklist_entries.update(raw)
+
+    except (json.JSONDecodeError, ValueError, OSError) as e:
+        print(f"Could not read {BLACKLIST_FILE}: {e}")
+
+        try:
+            os.replace(BLACKLIST_FILE, BLACKLIST_FILE + ".corrupt")
+        except OSError as backup_error:
+            print(f"Could not preserve corrupt blacklist file: {backup_error}")
+
+def normalize_blacklist_username(username: str) -> str:
+    return username.strip().casefold()
+
+async def add_blacklist_entry(username: str, reason: str, added_by: str):
+    # Create or replace a blacklist entry
+    username = username.strip()
+    key = normalize_blacklist_username(username)
+    entry = {
+        "username": username,
+        "reason": reason.strip(),
+        "added_by": added_by,
+        "date_added": datetime.now().strftime("%d/%m/%Y"),
+    }
+    blacklist_entries[key] = entry
+    await save_blacklist()
+    return entry
+
+async def remove_blacklist_entry(username: str, removed_by: str):
+    # Remove and return the matching blacklist entry
+    key = normalize_blacklist_username(username)
+    entry = blacklist_entries.pop(key, None)
+    if entry is None:
+        raise ValueError("That username is not on the blacklist.")
+
+    result = {
+        "username": entry.get("username", username.strip()),
+        "removed_by": removed_by,
+        "date_removed": datetime.now().strftime("%d/%m/%Y"),
+    }
+    await save_blacklist()
+    return result
+
+def list_blacklist_entries():
+    # Return blacklist entries
+    return sorted(
+        blacklist_entries.values(),
+        key=lambda entry: entry.get("username", "").casefold(),
+    )
+
+def get_blacklist_entry(username: str):
+    # Return the matching blacklist entry, or None if the user is not blacklisted
+    return blacklist_entries.get(normalize_blacklist_username(username))
+
+def require_blacklist_admin():
+    return require_roles(BLACKLIST_ADMIN_ROLE_IDS)
+
+# ============================================================
 # GENERIC HELPERS
 # ============================================================
 
@@ -659,6 +754,10 @@ class MyBot(commands.Bot):
             schedule_event_reminder(event)
         print(f"Loaded {len(active_events)} tracked event(s) from disk.")
 
+        # Reload blacklist entries from disk
+        load_blacklist()
+        print(f"Loaded {len(blacklist_entries)} blacklisted user(s) from disk.")
+
         # Reload LOA/discharge system after restart
         load_requests()
         self.add_view(RequestPanelView())
@@ -771,6 +870,21 @@ async def register(
     async with command_lock:
         await interaction.response.defer()
         try:
+            blacklist_entry = get_blacklist_entry(roblox_username)
+            if blacklist_entry is not None:
+                await interaction.followup.send(
+                    embed=make_error_embed(
+                        "User Blacklisted",
+                        (
+                            f"**{roblox_username}** is blacklisted and cannot be registered.\n\n"
+                            f"**Reason:** {blacklist_entry['reason']}\n"
+                            f"**Blacklisted by:** {blacklist_entry['added_by']}\n"
+                            f"**Date:** {blacklist_entry['date_added']}"
+                        ),
+                    )
+                )
+                return
+
             list_of_lists = await get_sheet_data()
             username_index = build_username_index(list_of_lists)
 
@@ -3511,6 +3625,224 @@ async def remove_loa_command(interaction: discord.Interaction, username: str):
             await interaction.followup.send(embed=make_error_embed(e.title, e.message))
         except Exception as e:
             print(f"Error in removeloa: {e}")
+            await interaction.followup.send(
+                embed=make_error_embed("Something Went Wrong", "An error occurred while processing the command.")
+            )
+
+# ============================================================
+# /blacklist
+# ============================================================
+@bot.tree.command(
+    name="blacklist",
+    description="Blacklist a Roblox user from registering."
+)
+@app_commands.describe(
+    username="The Roblox username to blacklist.",
+    reason="The reason for the blacklist.",
+)
+@require_blacklist_admin()
+async def blacklist_command(
+    interaction: discord.Interaction,
+    username: str,
+    reason: app_commands.Range[str, 1, 1000],
+):
+    username, reason = username.strip(), reason.strip()
+    if not username or not reason:
+        await interaction.response.send_message(
+            embed=make_error_embed("Invalid Input", "The username and the reason can't be empty."), ephemeral=True
+        )
+        return
+
+    # Busy check
+    if command_lock.locked():
+        await interaction.response.send_message(embed=make_busy_embed(), ephemeral=True)
+        return
+
+    async with command_lock:
+        await interaction.response.defer()
+        try:
+            result = await add_blacklist_entry(
+                username=username,
+                reason=reason,
+                added_by=interaction.user.display_name,
+            )
+
+            await interaction.followup.send(embed=make_embed(
+                interaction,
+                title=f"🚫 User Blacklisted | {result['username']}",
+                color=EMBED_COLOR_ERROR,
+                fields=[
+                    ("Username", result["username"], True),
+                    ("Reason", result["reason"], False),
+                    ("Added By", result["added_by"], True),
+                    ("Date Added", result["date_added"], True),
+                ],
+                verb="Updated",
+            ))
+            print(f"Blacklisted {result['username']} by {interaction.user}.")
+
+        except Exception as e:
+            print(f"Error in blacklist: {e}")
+            await interaction.followup.send(
+                embed=make_error_embed("Something Went Wrong", "An error occurred while processing the command.")
+            )
+
+# ============================================================
+# /unblacklist
+# ============================================================
+@bot.tree.command(
+    name="unblacklist",
+    description="Remove a Roblox user from the blacklist."
+)
+@app_commands.describe(
+    username="The Roblox username to remove from the blacklist.",
+)
+@require_blacklist_admin()
+async def unblacklist_command(
+    interaction: discord.Interaction,
+    username: str,
+):
+    username = username.strip()
+    if not username:
+        await interaction.response.send_message(
+            embed=make_error_embed("Invalid Input", "The username can't be empty."), ephemeral=True
+        )
+        return
+
+    # Busy check
+    if command_lock.locked():
+        await interaction.response.send_message(embed=make_busy_embed(), ephemeral=True)
+        return
+
+    async with command_lock:
+        await interaction.response.defer()
+        try:
+            result = await remove_blacklist_entry(
+                username=username,
+                removed_by=interaction.user.display_name,
+            )
+
+            await interaction.followup.send(embed=make_embed(
+                interaction,
+                title=f"✅ User Unblacklisted | {result['username']}",
+                color=EMBED_COLOR_SUCCESS,
+                fields=[
+                    ("Username", result["username"], True),
+                    ("Removed By", result["removed_by"], True),
+                    ("Date Removed", result["date_removed"], True),
+                ],
+                verb="Updated",
+            ))
+            print(f"Unblacklisted {result['username']} by {interaction.user}.")
+
+        except Exception as e:
+            print(f"Error in unblacklist: {e}")
+            await interaction.followup.send(
+                embed=make_error_embed("Something Went Wrong", "An error occurred while processing the command.")
+            )
+# ============================================================
+# /blstatus
+# ============================================================
+@bot.tree.command(
+    name="blstatus",
+    description="Show the blacklist status of a Roblox user."
+)
+@app_commands.describe(
+    username="The Roblox username to check.",
+)
+@require_role()
+async def blacklist_status_command(
+    interaction: discord.Interaction,
+    username: str,
+):
+    username = username.strip()
+    if not username:
+        await interaction.response.send_message(
+            embed=make_error_embed("Invalid Input", "The username can't be empty."), ephemeral=True
+        )
+        return
+
+    # Busy check
+    if command_lock.locked():
+        await interaction.response.send_message(embed=make_busy_embed(), ephemeral=True)
+        return
+
+    async with command_lock:
+        await interaction.response.defer()
+        try:
+            entry = get_blacklist_entry(username=username)
+
+            if entry is None:
+                await interaction.followup.send(embed=make_embed(
+                    interaction,
+                    title=f"✅ User Not Blacklisted | {username}",
+                    color=EMBED_COLOR_SUCCESS,
+                    description=f"**{username}** is not on the blacklist.",
+                    verb="Checked",
+                ))
+                
+            else:
+                await interaction.followup.send(embed=make_embed(
+                    interaction,
+                    title=f"🚫 User Blacklisted | {entry['username']}",
+                    color=EMBED_COLOR_ERROR,
+                    fields=[
+                        ("Username", entry["username"], True),
+                        ("Reason", entry["reason"], False),
+                        ("Added By", entry["added_by"], True),
+                        ("Date Added", entry["date_added"], True),
+                    ],
+                    verb="Checked",
+                ))
+
+        except Exception as e:
+            print(f"Error in blstatus: {e}")
+            await interaction.followup.send(
+                embed=make_error_embed("Something Went Wrong", "An error occurred while processing the command.")
+            )
+
+# ============================================================
+# /blacklists
+# ============================================================
+@bot.tree.command(
+    name="blacklists",
+    description="List all blacklisted Roblox users."
+)
+@require_blacklist_admin()
+async def blacklists_command(interaction: discord.Interaction):
+    # Busy check
+    if command_lock.locked():
+        await interaction.response.send_message(embed=make_busy_embed(), ephemeral=True)
+        return
+
+    async with command_lock:
+        await interaction.response.defer()
+        try:
+            entries = list_blacklist_entries()
+
+            if not entries:
+                await interaction.followup.send(embed=make_embed(
+                    interaction,
+                    title="✅ No Blacklisted Users",
+                    color=EMBED_COLOR_SUCCESS,
+                    description="There are currently no blacklisted Roblox users.",
+                    verb="Checked",
+                ))
+            else:
+                description = "\n".join(
+                    f"**{entry['username']}** - {entry['reason']} (added by {entry['added_by']} on {entry['date_added']})"
+                    for entry in entries
+                )
+                await interaction.followup.send(embed=make_embed(
+                    interaction,
+                    title=f"🚫 Blacklisted Users ({len(entries)})",
+                    color=EMBED_COLOR_ERROR,
+                    description=description,
+                    verb="Checked",
+                ))
+
+        except Exception as e:
+            print(f"Error in blacklists: {e}")
             await interaction.followup.send(
                 embed=make_error_embed("Something Went Wrong", "An error occurred while processing the command.")
             )
