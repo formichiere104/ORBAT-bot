@@ -383,6 +383,40 @@ def require_blacklist_admin():
     return require_roles(BLACKLIST_ADMIN_ROLE_IDS)
 
 # ============================================================
+# REGISTER SCHOOL CONFIG
+# ============================================================
+
+# To add a school, add one line here
+# first_row / last_row are 1-indexed sheet rows on the school sheet
+SCHOOLS = {
+    # key          label shown in dropdown     first_row  last_row
+    "siege":    {"label": "Siege School",    "first_row": 33,  "last_row": 82},
+    "ranger":   {"label": "Ranger School",   "first_row": 92,  "last_row": 117},
+    "engineer": {"label": "Engineer School", "first_row": 127, "last_row": 163},
+    "airborne": {"label": "Airborne School", "first_row": 173, "last_row": 210},
+}
+
+SCHOOL_NONE_KEY = "none"
+SCHOOL_NONE_LABEL = "None"
+
+# What gets written to the new trainee's row, besides the username in column D
+SCHOOL_ENROLL_RULES = [
+    ("J", True),     # trainee checkbox ticked
+    ("K:L", False),  # other two checkboxes unticked
+]
+
+# ============================================================
+# /schoolphase CONFIG
+# ============================================================
+
+# One entry per phase
+SCHOOL_PHASES = {
+    "phase1": {"label": "Phase 1", "column": "J"},
+    "phase2": {"label": "Phase 2", "column": "K"},
+    "phase3": {"label": "Phase 3", "column": "L"},
+}
+
+# ============================================================
 # GENERIC HELPERS
 # ============================================================
 
@@ -815,15 +849,174 @@ async def test(interaction: discord.Interaction):
         embed=make_embed(interaction, title="Five more minutes please- 😴", color=EMBED_COLOR_SUCCESS)
     )
 
-# ------------------------------------------------------------
+# ============================================================
+# /schoolphase HELPERS
+# ============================================================
+
+def build_school_index(column_values):
+    # Only scans the ranges specified in SCHOOLS
+    index = {}
+    for school_key, info in SCHOOLS.items():
+        last = min(info["last_row"], len(column_values))
+        for row_number in range(info["first_row"], last + 1):
+            name = get_cell(column_values[row_number - 1], 0).strip()
+            if name:
+                index.setdefault(name.lower(), []).append((school_key, row_number, name))
+    return index
+
+# ============================================================
+# /schoolphase
+# ============================================================
+@bot.tree.command(name="schoolphase", description="Set the school phase of one or more trainees.")
+@app_commands.describe(
+    usernames="Username or usernames separated by commas (e.g. user1,user2,user3).",
+    phase="The phase to tick.",
+)
+@app_commands.choices(
+    phase=[app_commands.Choice(name=info["label"], value=key) for key, info in SCHOOL_PHASES.items()]
+)
+@require_role()
+async def schoolphase(interaction: discord.Interaction, usernames: str, phase: app_commands.Choice[str]):
+
+    # Parse the list
+    names_list = parse_username_list(usernames)
+    if not names_list:
+        await interaction.response.send_message(
+            embed=make_error_embed("No Usernames Provided", "You must provide at least one username."),
+            ephemeral=True,
+        )
+        return
+
+    # Busy check
+    if command_lock.locked():
+        await interaction.response.send_message(embed=make_busy_embed(), ephemeral=True)
+        return
+
+    async with command_lock:
+        await interaction.response.defer()
+        try:
+            column = await asyncio.to_thread(fetch_school_username_column)
+            if column is None:
+                await interaction.followup.send(embed=make_error_embed(
+                    "Sheets Error",
+                    f"Couldn't read the **{DISCHARGE_SCHOOL_SHEET_NAME}** sheet. Nothing was changed.",
+                ))
+                return
+
+            school_index = build_school_index(column)
+
+            rules = [(info["column"], key == phase.value) for key, info in SCHOOL_PHASES.items()]
+
+            updates, updated, not_found = [], [], []
+            for name in names_list:
+                matches = school_index.get(name.lower())
+                if not matches:
+                    not_found.append(name)
+                    continue
+                for school_key, row_number, display_name in matches:
+                    updates += build_rule_updates(DISCHARGE_SCHOOL_SHEET_NAME, row_number, rules)
+                    updated.append(f"{display_name} : {SCHOOLS[school_key]['label']} (row {row_number})")
+
+            if updates:
+                try:
+                    await asyncio.to_thread(write_discharge_updates, updates)
+                except APIError as e:
+                    print(f"Google Sheets API error in schoolphase: {e}")
+                    await interaction.followup.send(embed=make_error_embed(
+                        "Sheets Error",
+                        "Google rejected the request. Check that the bot can edit the school sheet. Nothing was changed.",
+                    ))
+                    return
+
+            # Result embed
+            fields = [(f"Updated ({len(updated)})", "\n".join(updated) or "None", False)]
+            if not_found:
+                fields.append((
+                    f"Not Found ({len(not_found)})",
+                    "\n".join(not_found) + f"\n*User/s could not be found in {DISCHARGE_SCHOOL_SHEET_NAME}.*",
+                    False,
+                ))
+
+            await interaction.followup.send(embed=make_embed(
+                interaction,
+                title=f"School Phase Results - {phase.name}",
+                description=f"Troopers updated to **{phase.name}**.",
+                color=EMBED_COLOR_SUCCESS if updated else EMBED_COLOR_GOLD,
+                fields=fields,
+                verb="Updated",
+            ))
+            print(f"School phase ({phase.name}) completed: {len(updated)} updated, {len(not_found)} not found.")
+
+        except Exception as e:
+            print(f"Error in schoolphase: {e}")
+            await interaction.followup.send(
+                embed=make_error_embed("Something Went Wrong", "An error occurred while processing the command.")
+            )
+
+# ============================================================
+# REGISTER SCHOOL HELPERS
+# ============================================================
+
+def fetch_school_username_column():
+    try:
+        response = sh.values_batch_get(
+            [quoted_range(DISCHARGE_SCHOOL_SHEET_NAME, f"{SHEET_USERNAME_COL}:{SHEET_USERNAME_COL}")]
+        )
+        return response["valueRanges"][0].get("values", [])
+    except APIError as e:
+        print(f"Could not read {DISCHARGE_SCHOOL_SHEET_NAME}: {e}")
+        return None
+
+
+def find_free_school_row(column_values, first_row, last_row):
+    for row_number in range(first_row, last_row + 1):
+        if row_number > len(column_values) or not get_cell(column_values[row_number - 1], 0).strip():
+            return row_number
+    return None
+
+
+async def enroll_in_school(username, school_key, school_column):
+    # Returns (success: bool, text_for_the_embed)
+    school = SCHOOLS[school_key]
+
+    if school_column is None:
+        return False, f"Couldn't read the **{DISCHARGE_SCHOOL_SHEET_NAME}** sheet. Add them to {school['label']} manually."
+
+    # Every slot of this school is taken
+    row = find_free_school_row(school_column, school["first_row"], school["last_row"])
+    if row is None:
+        return False, (
+            f"**{school['label']}** is full (rows {school['first_row']}-{school['last_row']}). "
+            "The recruit was registered, but not added to the school."
+        )
+
+    rules = [(SHEET_USERNAME_COL, sheet_safe_text(username))] + SCHOOL_ENROLL_RULES
+    updates = build_rule_updates(DISCHARGE_SCHOOL_SHEET_NAME, row, rules)
+
+    try:
+        await asyncio.to_thread(write_discharge_updates, updates)
+    except APIError as e:
+        print(f"Google Sheets API error in school enrollment: {e}")
+        return False, f"Google rejected the school update. Add them to {school['label']} manually."
+
+    return True, f"{school['label']} (row {row})"
+
+
+# ============================================================
 # /register
-# ------------------------------------------------------------
+# ============================================================
+
 @bot.tree.command(name="register", description="Register a new recruit in the battalion sheet.")
 @app_commands.describe(
     roblox_username="The recruit's Roblox username.",
     ct_number="The recruit's 4-digit CT number (e.g. 5142).",
     nickname="The recruit's nickname (e.g. Henry).",
     timezone="The recruit's timezone (e.g. CEST, or N/A if none).",
+    company_school="Also enroll the recruit as a trainee in a school (or None).",
+)
+@app_commands.choices(
+    company_school=[app_commands.Choice(name=SCHOOL_NONE_LABEL, value=SCHOOL_NONE_KEY)]
+    + [app_commands.Choice(name=info["label"], value=key) for key, info in SCHOOLS.items()]
 )
 @require_role()
 async def register(
@@ -832,6 +1025,7 @@ async def register(
     ct_number: app_commands.Range[str, 4, 4],
     nickname: str,
     timezone: str,
+    company_school: app_commands.Choice[str],
 ):
 
     roblox_username = roblox_username.strip()
@@ -885,7 +1079,16 @@ async def register(
                 )
                 return
 
-            list_of_lists = await get_sheet_data()
+            school_key = company_school.value
+
+            if school_key == SCHOOL_NONE_KEY:
+                list_of_lists = await get_sheet_data()
+                school_column = None
+            else:
+                list_of_lists, school_column = await asyncio.gather(
+                    get_sheet_data(),
+                    asyncio.to_thread(fetch_school_username_column),
+                )
             username_index = build_username_index(list_of_lists)
 
             if roblox_username.lower() in username_index:
@@ -919,18 +1122,30 @@ async def register(
 
             await update_cells(cell_list)
 
+            # Registration is already saved at this point, so a school problem can only add a warning, never undo it
+            school_ok, school_text = None, None
+            if school_key != SCHOOL_NONE_KEY:
+                school_ok, school_text = await enroll_in_school(roblox_username, school_key, school_column)
+
+            # Build the fields first so the school info can be appended
+            fields = [
+                ("Username", roblox_username, True),
+                ("Rank", "Private", True),
+                ("Designation", designation, True),
+                ("Timezone", timezone, True),
+                ("Joined", join_date, True),
+            ]
+            if school_ok is True:
+                fields.append(("School", f"{school_text}", True))
+            elif school_ok is False:
+                fields.append(("⚠️ School Not Assigned", school_text, False))
+
             embed = make_embed(
                 interaction,
                 title="New Recruit Registered",
                 description=f"**{roblox_username}** has been added to the roster.",
                 color=EMBED_COLOR_SUCCESS,
-                fields=[
-                    ("Username", roblox_username, True),
-                    ("Rank", "Private", True),
-                    ("Designation", designation, True),
-                    ("Timezone", timezone, True),
-                    ("Joined", join_date, True),
-                ],
+                fields=fields,
                 verb="Updated",
             )
             await interaction.followup.send(embed=embed)
